@@ -17,7 +17,7 @@ from telegram.ext import (
 # НАСТРОЙКИ КАЛЬКУЛЯТОРА
 # =========================
 FUND_SHARE: Final[float] = 0.20       # 20% портфеля сразу в фонды
-DEFAULT_BOND_RATE: Final[float] = 0.15  # 15% средняя доходность облигаций
+DEFAULT_BOND_RATE: Final[float] = 0.10  # 10% средняя доходность облигаций
 
 AMOUNT, TERM = range(2)
 
