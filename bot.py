@@ -1,11 +1,10 @@
 import logging
+import math
 import os
-import re
 from datetime import datetime, timedelta, timezone
-from html.parser import HTMLParser
 from typing import Final
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+import xml.etree.ElementTree as ET
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -22,7 +21,8 @@ from telegram.ext import (
 # НАСТРОЙКИ КАЛЬКУЛЯТОРА
 # =========================
 FUND_SHARE: Final[float] = 0.20
-CBR_URL: Final[str] = "https://www.cbr.ru/hd_base/zcyc_params/"
+CBR_SOAP_URL: Final[str] = "https://www.cbr.ru/secinfo/secinfo.asmx"
+CBR_SOAP_ACTION: Final[str] = "http://web.cbr.ru/zcyc_paramsXML"
 CACHE_HOURS: Final[int] = 6
 
 # Точки КБД ОФЗ, публикуемые Банком России
@@ -65,38 +65,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class TableParser(HTMLParser):
-    """Собирает текст ячеек HTML-таблиц в строки."""
-
-    def __init__(self):
-        super().__init__()
-        self.rows: list[list[str]] = []
-        self._row: list[str] | None = None
-        self._cell_parts: list[str] | None = None
-
-    def handle_starttag(self, tag, attrs):
-        if tag == "tr":
-            self._row = []
-        elif tag in ("td", "th") and self._row is not None:
-            self._cell_parts = []
-
-    def handle_data(self, data):
-        if self._cell_parts is not None:
-            self._cell_parts.append(data)
-
-    def handle_endtag(self, tag):
-        if tag in ("td", "th") and self._cell_parts is not None:
-            cell = " ".join("".join(self._cell_parts).replace("\xa0", " ").split())
-            if self._row is not None:
-                self._row.append(cell)
-            self._cell_parts = None
-        elif tag == "tr" and self._row is not None:
-            if self._row:
-                self.rows.append(self._row)
-            self._row = None
-            self._cell_parts = None
-
-
 def money(value: float) -> str:
     return f"{value:,.0f}".replace(",", " ") + " ₽"
 
@@ -107,7 +75,8 @@ def pct(value: float) -> str:
 
 def parse_number(value: str) -> float:
     cleaned = (
-        value.replace("\xa0", "")
+        str(value)
+        .replace("\xa0", "")
         .replace(" ", "")
         .replace(",", ".")
         .replace("%", "")
@@ -116,58 +85,217 @@ def parse_number(value: str) -> float:
     return float(cleaned)
 
 
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1].strip()
+
+
+def _parse_date(value: str):
+    value = str(value).strip()
+    candidates = (
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%d",
+        "%d.%m.%Y",
+    )
+    clean = value.replace("Z", "")
+    if "+" in clean[10:]:
+        clean = clean.split("+", 1)[0]
+
+    for fmt in candidates:
+        try:
+            return datetime.strptime(clean, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _yield_from_params(
+    years: float,
+    b1: float,
+    b2: float,
+    b3: float,
+    t1: float,
+    g_values: list[float],
+) -> float:
+    """
+    Расчёт КБД из параметров G-кривой.
+    Результат возвращается долей: например 0.135 = 13,5%.
+    """
+    t = float(years)
+    tau = float(t1)
+    if t <= 0 or tau <= 0:
+        raise ValueError("Некорректные параметры КБД.")
+
+    exp_part = math.exp(-t / tau)
+    term1 = b1 + b2 * tau * (1 - exp_part) / t
+    term2 = b3 * ((1 - exp_part) * tau / t - exp_part)
+
+    # Корректирующие члены G-кривой.
+    a_values = [0.0] * 9
+    b_values = [0.0] * 9
+    a_values[0] = 0.0
+    a_values[1] = 0.6
+    b_values[0] = 0.6
+    k = 1.6
+
+    for i in range(2, 9):
+        a_values[i] = a_values[i - 1] + k ** (i - 1)
+        b_values[i - 1] = b_values[i - 2] * k
+    b_values[8] = b_values[7] * k
+
+    correction = 0.0
+    for i, g in enumerate(g_values[:9]):
+        width = b_values[i]
+        if width > 0:
+            correction += g * math.exp(-((t - a_values[i]) ** 2) / (width ** 2))
+
+    continuously_compounded = (term1 + term2 + correction) / 10000.0
+    annual_effective_pct = 100.0 * (math.exp(continuously_compounded) - 1.0)
+    return annual_effective_pct / 100.0
+
+
+def _extract_rows(root: ET.Element) -> list[dict[str, str]]:
+    """
+    Извлекает табличные строки из SOAP/DataSet независимо от namespace.
+    """
+    rows: list[dict[str, str]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+
+    for elem in root.iter():
+        children = list(elem)
+        if not children:
+            continue
+
+        row: dict[str, str] = {}
+        for child in children:
+            if list(child):
+                continue
+            value = (child.text or "").strip()
+            if value:
+                row[_local_name(child.tag).upper()] = value
+
+        if len(row) < 4:
+            continue
+
+        marker = tuple(row.items())
+        if marker not in seen:
+            seen.add(marker)
+            rows.append(row)
+
+    return rows
+
+
+def _curve_from_row(row: dict[str, str]):
+    """
+    Поддерживает два варианта ответа Банка России:
+    1) готовые значения КБД по стандартным срокам;
+    2) параметры B1/B2/B3/T1/G1...G9, из которых строится КБД.
+    """
+    row_date = None
+    for value in row.values():
+        parsed = _parse_date(value)
+        if parsed is not None:
+            row_date = parsed
+            break
+
+    if row_date is None:
+        return None
+
+    # Вариант с параметрами G-кривой.
+    parameter_keys = ["B1", "B2", "B3", "T1"] + [f"G{i}" for i in range(1, 10)]
+    if all(key in row for key in parameter_keys):
+        try:
+            b1 = parse_number(row["B1"])
+            b2 = parse_number(row["B2"])
+            b3 = parse_number(row["B3"])
+            t1 = parse_number(row["T1"])
+            g_values = [parse_number(row[f"G{i}"]) for i in range(1, 10)]
+            curve = {
+                term: _yield_from_params(term, b1, b2, b3, t1, g_values)
+                for term in CBR_TERMS
+            }
+            if all(0.0 < value < 1.0 for value in curve.values()):
+                return row_date, curve
+        except (ValueError, OverflowError):
+            pass
+
+    # Вариант, когда сервис вернул сразу 12 значений доходности.
+    numbers: list[float] = []
+    for value in row.values():
+        if _parse_date(value) is not None:
+            continue
+        try:
+            number = parse_number(value)
+        except ValueError:
+            continue
+        numbers.append(number)
+
+    if len(numbers) == len(CBR_TERMS) and all(0 < n < 100 for n in numbers):
+        curve = {
+            term: value / 100.0
+            for term, value in zip(CBR_TERMS, numbers)
+        }
+        return row_date, curve
+
+    return None
+
+
 def fetch_cbr_curve() -> tuple[str, dict[float, float]]:
     """
-    Загружает последние доступные значения КБД ОФЗ с сайта Банка России.
-    Запрашивается окно последних 14 дней, чтобы корректно переживать выходные
-    и праздничные дни.
+    Получает КБД через официальный SOAP-веб-сервис Банка России SecInfo.
+    Запрашиваем последние 14 дней, чтобы переживать выходные и праздники.
     """
     today = datetime.now(timezone.utc).date()
     date_from = today - timedelta(days=14)
 
-    params = {
-        "UniDbQuery.Posted": "True",
-        "UniDbQuery.From": date_from.strftime("%d.%m.%Y"),
-        "UniDbQuery.To": today.strftime("%d.%m.%Y"),
-    }
-    url = f"{CBR_URL}?{urlencode(params)}"
+    soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+    xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <zcyc_paramsXML xmlns="http://web.cbr.ru/">
+      <OnDate>{date_from.isoformat()}T00:00:00</OnDate>
+      <ToDate>{today.isoformat()}T23:59:59</ToDate>
+    </zcyc_paramsXML>
+  </soap:Body>
+</soap:Envelope>""".encode("utf-8")
 
     request = Request(
-        url,
+        CBR_SOAP_URL,
+        data=soap_body,
+        method="POST",
         headers={
-            "User-Agent": (
-                "Mozilla/5.0 (compatible; PortfolioCalculatorBot/2.0; "
-                "+https://www.cbr.ru/)"
-            ),
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            "Content-Type": "text/xml; charset=utf-8",
+            "SOAPAction": f'"{CBR_SOAP_ACTION}"',
+            "User-Agent": "PortfolioCalculatorBot/3.0",
+            "Accept": "text/xml, application/xml",
         },
     )
 
-    with urlopen(request, timeout=12) as response:
-        html = response.read().decode("utf-8", errors="replace")
+    with urlopen(request, timeout=15) as response:
+        payload = response.read()
 
-    parser = TableParser()
-    parser.feed(html)
+    root = ET.fromstring(payload)
+    candidates = []
 
-    date_pattern = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
+    for row in _extract_rows(root):
+        parsed = _curve_from_row(row)
+        if parsed is not None:
+            candidates.append(parsed)
 
-    for row in parser.rows:
-        if len(row) < 13 or not date_pattern.fullmatch(row[0]):
-            continue
+    if not candidates:
+        raise ValueError(
+            "В ответе SecInfo Банка России не найдены данные КБД."
+        )
 
-        try:
-            values = [parse_number(x) / 100 for x in row[1:13]]
-        except ValueError:
-            continue
+    curve_date, curve = max(candidates, key=lambda item: item[0])
 
-        if len(values) != len(CBR_TERMS):
-            continue
+    # Дополнительная проверка здравого диапазона.
+    if not all(0.001 < value < 0.60 for value in curve.values()):
+        raise ValueError("Получены некорректные значения КБД.")
 
-        curve = dict(zip(CBR_TERMS, values))
-        return row[0], curve
-
-    raise ValueError("На странице Банка России не найдена строка с данными КБД.")
-
+    return curve_date.strftime("%d.%m.%Y"), curve
 
 def get_cbr_curve() -> tuple[str, dict[float, float], bool]:
     """
@@ -197,9 +325,9 @@ def get_cbr_curve() -> tuple[str, dict[float, float], bool]:
                 "is_fallback": False,
             }
         )
-        logger.info("CBR curve updated: %s", curve_date)
+        logger.info("CBR SecInfo curve updated: %s", curve_date)
     except Exception:
-        logger.exception("Failed to update CBR curve; using cached/fallback data")
+        logger.exception("Failed to update CBR SecInfo curve; using cached/fallback data")
         _curve_cache["fetched_at"] = now
 
     return (
@@ -278,11 +406,13 @@ def term_keyboard() -> InlineKeyboardMarkup:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Привет! 👋\n\n"
-        "Я помогу рассчитать структуру портфеля по нашей модели:\n"
-        "20% — фонды, а оставшаяся часть распределяется между "
-        "облигациями и акциями с учётом срока инвестирования.\n\n"
-        "Доходность для расчёта определяется автоматически по актуальной "
-        "кривой бескупонной доходности ОФЗ Банка России.\n\n"
+        "Я помогу рассчитать доли в модельном инвестиционном портфеле "
+        "с учётом суммы и срока инвестирования.\n\n"
+        "В основе модели — защитная облигационная часть: её расчётная "
+        "доходность учитывается при распределении капитала между "
+        "облигациями, акциями и фондами.\n\n"
+        "Доходность определяется автоматически по актуальной кривой "
+        "бескупонной доходности ОФЗ Банка России.\n\n"
         "Нажмите кнопку ниже, чтобы начать."
     )
     if update.message:
@@ -370,11 +500,7 @@ async def show_result(
     years_text = f"{years:g}".replace(".", ",")
     rate_text = pct(bond_rate)
 
-    data_note = (
-        f"Данные Банка России на {curve_date}."
-        if not is_fallback
-        else f"Использованы последние сохранённые данные Банка России на {curve_date}."
-    )
+    data_note = f"КБД ОФЗ: данные Банка России на {curve_date}."
 
     text = (
         "📊 СТРУКТУРА ПОРТФЕЛЯ\n\n"
@@ -384,9 +510,8 @@ async def show_result(
         f"💲 Фонды — {pct(result['funds_pct'])} · {money(result['funds'])}\n"
         f"📈 Облигации — {pct(result['bonds_pct'])} · {money(result['bonds'])}\n"
         f"🚀 Акции — {pct(result['stocks_pct'])} · {money(result['stocks'])}\n\n"
-        "ℹ️ Доходность определяется автоматически по кривой бескупонной "
-        "доходности ОФЗ Банка России. Для промежуточных сроков используется "
-        "линейная интерполяция.\n"
+        "ℹ️ Расчётная доходность определяется автоматически на основе "
+        "кривой бескупонной доходности ОФЗ Банка России.\n"
         f"{data_note}\n\n"
         "Расчёт носит модельный характер и не является индивидуальной "
         "инвестиционной рекомендацией."
