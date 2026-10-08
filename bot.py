@@ -2,6 +2,7 @@ import logging
 import math
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Final
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
@@ -24,6 +25,7 @@ FUND_SHARE: Final[float] = 0.20
 CBR_SOAP_URL: Final[str] = "https://www.cbr.ru/secinfo/secinfo.asmx"
 CBR_SOAP_ACTION: Final[str] = "http://web.cbr.ru/zcyc_paramsXML"
 CACHE_HOURS: Final[int] = 6
+WELCOME_IMAGE: Final[Path] = Path(__file__).with_name("welcome.jpg")
 
 # Точки КБД ОФЗ, публикуемые Банком России
 CBR_TERMS: Final[tuple[float, ...]] = (
@@ -416,20 +418,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Нажмите кнопку ниже, чтобы начать."
     )
     if update.message:
-        await update.message.reply_text(text, reply_markup=main_keyboard())
+        with WELCOME_IMAGE.open("rb") as photo:
+            await update.message.reply_photo(photo=photo, caption=text, reply_markup=main_keyboard())
     else:
         query = update.callback_query
         await query.answer()
-        await query.edit_message_text(text, reply_markup=main_keyboard())
+        with WELCOME_IMAGE.open("rb") as photo:
+            if query.message.photo:
+                from telegram import InputMediaPhoto
+                await query.edit_message_media(media=InputMediaPhoto(media=photo, caption=text), reply_markup=main_keyboard())
+            else:
+                await query.message.delete()
+                await context.bot.send_photo(chat_id=query.message.chat_id, photo=photo, caption=text, reply_markup=main_keyboard())
 
 
 async def begin_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text(
-        "Введите сумму портфеля в рублях.\n\n"
-        "Например: 300000"
-    )
+    prompt = "Введите сумму портфеля в рублях.\n\nНапример: 300000"
+    if query.message.photo:
+        await query.message.delete()
+        await context.bot.send_message(chat_id=query.message.chat_id, text=prompt)
+    else:
+        await query.edit_message_text(prompt)
     return AMOUNT
 
 
