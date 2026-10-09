@@ -518,7 +518,7 @@ async def show_result(
         f"Сумма: {money(amount)}\n"
         f"Срок: {years_text} лет\n"
         f"Расчётная доходность на выбранный срок: {rate_text} годовых\n\n"
-        f"💲 Фонды — {pct(result['funds_pct'])} · {money(result['funds'])}\n"
+        f"🏆 Золото — {pct(result['funds_pct'])} · {money(result['funds'])}\n"
         f"📈 Облигации — {pct(result['bonds_pct'])} · {money(result['bonds'])}\n"
         f"🚀 Акции — {pct(result['stocks_pct'])} · {money(result['stocks'])}\n\n"
         "ℹ️ Расчётная доходность определяется автоматически на основе "
