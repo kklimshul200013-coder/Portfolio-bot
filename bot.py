@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import math
 import os
@@ -9,6 +10,7 @@ from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -60,6 +62,8 @@ _curve_cache = {
 }
 
 AMOUNT, TERM = range(2)
+BROADCAST_TEXT, BROADCAST_CONFIRM = range(2, 4)
+BROADCAST_MAX_LENGTH: Final[int] = 3500
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -673,7 +677,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ADMIN_USER_ID: Final[int] = 393436657
 
 
-
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
@@ -685,10 +688,164 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔄 Обновить", callback_data="admin:menu")],
     ])
 
+
 def admin_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⬅️ В админ-панель", callback_data="admin:menu")]
     ])
+
+
+def broadcast_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ Создать рассылку", callback_data="broadcast:create")],
+        [InlineKeyboardButton("⬅️ В админ-панель", callback_data="admin:menu")],
+    ])
+
+
+def _broadcast_allowed(update: Update) -> bool:
+    return bool(update.effective_user and update.effective_user.id == ADMIN_USER_ID
+                and update.effective_chat and update.effective_chat.type == "private")
+
+
+async def broadcast_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not _broadcast_allowed(update):
+        await query.answer("Доступ запрещён", show_alert=True)
+        return
+    await query.answer()
+    await query.edit_message_text(
+        "📨 SVETINVEST | РАССЫЛКИ\n\n"
+        "Создайте текстовое сообщение для пользователей бота. "
+        "Перед отправкой будет предварительный просмотр и подтверждение.",
+        reply_markup=broadcast_keyboard(),
+    )
+
+
+async def broadcast_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not _broadcast_allowed(update):
+        await query.answer("Доступ запрещён", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data.pop("broadcast_draft", None)
+    await query.edit_message_text(
+        "✍️ Отправьте текст рассылки одним сообщением "
+        f"(не более {BROADCAST_MAX_LENGTH} символов).\n\n"
+        "Для отмены отправьте /cancel или нажмите кнопку ниже.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Отменить", callback_data="broadcast:cancel")]
+        ]),
+    )
+    return BROADCAST_TEXT
+
+
+async def broadcast_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _broadcast_allowed(update):
+        return ConversationHandler.END
+    draft = (update.message.text or "").strip()
+    if not draft or len(draft) > BROADCAST_MAX_LENGTH:
+        await update.message.reply_text(
+            f"Текст должен содержать от 1 до {BROADCAST_MAX_LENGTH} символов. "
+            "Отправьте другой текст или /cancel."
+        )
+        return BROADCAST_TEXT
+    context.user_data["broadcast_draft"] = draft
+    await update.message.reply_text(
+        "👀 ПРЕДПРОСМОТР РАССЫЛКИ\n\n" + draft +
+        "\n\nОтправить это сообщение всем пользователям?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Отправить всем", callback_data="broadcast:send")],
+            [InlineKeyboardButton("✏️ Изменить текст", callback_data="broadcast:create")],
+            [InlineKeyboardButton("❌ Отменить", callback_data="broadcast:cancel")],
+        ]),
+    )
+    return BROADCAST_CONFIRM
+
+
+def _broadcast_recipients() -> list[int]:
+    if not DATABASE_URL:
+        raise RuntimeError("База данных не подключена")
+    with psycopg.connect(DATABASE_URL, connect_timeout=10) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM bot_users ORDER BY user_id")
+            return [int(row[0]) for row in cur.fetchall()]
+
+
+async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not _broadcast_allowed(update):
+        await query.answer("Доступ запрещён", show_alert=True)
+        return ConversationHandler.END
+    if context.application.bot_data.get("broadcast_running"):
+        await query.answer("Рассылка уже выполняется", show_alert=True)
+        return BROADCAST_CONFIRM
+    draft = context.user_data.get("broadcast_draft")
+    if not draft:
+        await query.answer("Текст не найден. Создайте рассылку заново.", show_alert=True)
+        return ConversationHandler.END
+
+    # Устанавливаем блокировку до первого await, чтобы исключить повторную отправку.
+    context.application.bot_data["broadcast_running"] = True
+    try:
+        await query.answer("Рассылка запущена")
+        await query.edit_message_text("📨 Отправка сообщений началась. Дождитесь отчёта…")
+        recipients = await asyncio.to_thread(_broadcast_recipients)
+        sent = 0
+        failed = 0
+        for user_id in recipients:
+            for attempt in range(2):
+                try:
+                    await context.bot.send_message(chat_id=user_id, text=draft)
+                    sent += 1
+                    break
+                except RetryAfter as exc:
+                    if attempt == 0:
+                        await asyncio.sleep(min(float(exc.retry_after) + 1, 60))
+                        continue
+                    failed += 1
+                    logger.warning("Broadcast rate limited for user %s", user_id)
+                except TelegramError as exc:
+                    failed += 1
+                    logger.warning("Broadcast failed for user %s: %s", user_id, exc)
+                    break
+            await asyncio.sleep(0.07)
+        await query.edit_message_text(
+            "📨 SVETINVEST | РАССЫЛКА ЗАВЕРШЕНА\n\n"
+            f"👥 Получателей в базе: {len(recipients)}\n"
+            f"✅ Успешно отправлено: {sent}\n"
+            f"❌ Ошибок отправки: {failed}\n\n"
+            "Ошибки возможны, если пользователь заблокировал бота или удалил чат.",
+            reply_markup=admin_back_keyboard(),
+        )
+    except Exception:
+        logger.exception("Ошибка выполнения рассылки")
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text="❌ Рассылка прервана из-за ошибки. Проверьте логи Railway. "
+                 "Перед повторной отправкой проверьте, кому сообщения уже пришли.",
+        )
+    finally:
+        context.user_data.pop("broadcast_draft", None)
+        context.application.bot_data["broadcast_running"] = False
+    return ConversationHandler.END
+
+
+async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _broadcast_allowed(update):
+        if update.callback_query:
+            await update.callback_query.answer("Доступ запрещён", show_alert=True)
+        return ConversationHandler.END
+    context.user_data.pop("broadcast_draft", None)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            "❌ Рассылка отменена.", reply_markup=admin_back_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Рассылка отменена.", reply_markup=admin_back_keyboard()
+        )
+    return ConversationHandler.END
 
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -891,9 +1048,28 @@ def run():
         allow_reentry=True,
     )
 
+    broadcast_conversation = ConversationHandler(
+        entry_points=[CallbackQueryHandler(broadcast_create, pattern=r"^broadcast:create$")],
+        states={
+            BROADCAST_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_receive_text),
+                CallbackQueryHandler(broadcast_cancel, pattern=r"^broadcast:cancel$"),
+            ],
+            BROADCAST_CONFIRM: [
+                CallbackQueryHandler(broadcast_send, pattern=r"^broadcast:send$"),
+                CallbackQueryHandler(broadcast_create, pattern=r"^broadcast:create$"),
+                CallbackQueryHandler(broadcast_cancel, pattern=r"^broadcast:cancel$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", broadcast_cancel)],
+        allow_reentry=True,
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CallbackQueryHandler(admin_action, pattern=r"^admin:(?:menu|stats|users|calculations|funnel|daily)$"))
+    app.add_handler(CallbackQueryHandler(broadcast_menu, pattern=r"^broadcast:menu$"))
+    app.add_handler(broadcast_conversation)
     app.add_handler(CallbackQueryHandler(home, pattern=r"^home$"))
     app.add_handler(conversation)
 
