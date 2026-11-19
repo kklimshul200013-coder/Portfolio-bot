@@ -594,6 +594,50 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Расчёт отменён.", reply_markup=main_keyboard())
     return ConversationHandler.END
 
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Доступ только владельцу
+    if not update.effective_user or update.effective_user.id != 393436657:
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+
+    if not DATABASE_URL:
+        await update.message.reply_text("База данных не подключена.")
+        return
+
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        COUNT(*),
+                        COUNT(*) FILTER (
+                            WHERE joined_at >= CURRENT_DATE
+                        ),
+                        COUNT(*) FILTER (
+                            WHERE joined_at >= NOW() - INTERVAL '7 days'
+                        ),
+                        COUNT(*) FILTER (
+                            WHERE last_active_at >= NOW() - INTERVAL '7 days'
+                        ),
+                        MAX(joined_at)
+                    FROM bot_users
+                """)
+                total, today, week_new, week_active, latest = cur.fetchone()
+
+        text = (
+            "🛡 SVETINVEST | АДМИН-ПАНЕЛЬ\n\n"
+            f"👥 Всего пользователей: {total}\n"
+            f"🆕 Новых сегодня: {today}\n"
+            f"📅 Новых за 7 дней: {week_new}\n"
+            f"📊 Активных за 7 дней: {week_active}\n\n"
+            f"Последняя регистрация: "
+            f"{latest.strftime('%d.%m.%Y %H:%M') if latest else 'Нет данных'}"
+        )
+        await update.message.reply_text(text)
+
+    except Exception:
+        logger.exception("Ошибка административной панели")
+        await update.message.reply_text("Не удалось получить статистику.")
 
 def run():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -621,6 +665,7 @@ def run():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CallbackQueryHandler(home, pattern=r"^home$"))
     app.add_handler(conversation)
 
