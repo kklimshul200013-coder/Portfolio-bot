@@ -90,6 +90,28 @@ def init_database():
     except Exception:
         logger.exception("Ошибка инициализации PostgreSQL")
 
+def save_user(user):
+    if not DATABASE_URL or user is None:
+        return
+
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bot_users (user_id, username, first_name)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id)
+                    DO UPDATE SET
+                        username = EXCLUDED.username,
+                        first_name = EXCLUDED.first_name,
+                        last_active_at = NOW()
+                    """,
+                    (user.id, user.username, user.first_name)
+                )
+    except Exception:
+        logger.exception("Ошибка сохранения пользователя")
+
 def money(value: float) -> str:
     return f"{value:,.0f}".replace(",", " ") + " ₽"
 
@@ -429,6 +451,8 @@ def term_keyboard() -> InlineKeyboardMarkup:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user:
+        save_user(update.effective_user)
     text = (
         "Привет! 👋\n\n"
         "Я помогу рассчитать доли в модельном инвестиционном портфеле "
