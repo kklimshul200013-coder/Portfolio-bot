@@ -86,6 +86,23 @@ def init_database():
                         last_active_at TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS portfolio_calculations (
+                        id BIGSERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        amount NUMERIC(18,2) NOT NULL,
+                        years NUMERIC(6,2) NOT NULL,
+                        bond_rate NUMERIC(10,6) NOT NULL,
+                        calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_portfolio_calculations_date
+                    ON portfolio_calculations (calculated_at)
+                """)
+        logger.info("Таблица portfolio_calculations готова")
         logger.info("Таблица bot_users готова")
     except Exception:
         logger.exception("Ошибка инициализации PostgreSQL")
@@ -111,6 +128,21 @@ def save_user(user):
                 )
     except Exception:
         logger.exception("Ошибка сохранения пользователя")
+
+def record_calculation(user, amount: float, years: float, bond_rate: float):
+    """Сохраняет только успешно выполненные расчёты."""
+    if not DATABASE_URL or user is None:
+        return
+    try:
+        with psycopg.connect(DATABASE_URL, connect_timeout=10) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO portfolio_calculations (user_id, amount, years, bond_rate)
+                    VALUES (%s, %s, %s, %s)
+                """, (user.id, amount, years, bond_rate))
+    except Exception:
+        logger.exception("Ошибка сохранения расчёта")
+
 
 def money(value: float) -> str:
     return f"{value:,.0f}".replace(",", " ") + " ₽"
@@ -480,6 +512,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def begin_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_user(update.effective_user)
     query = update.callback_query
     await query.answer()
     prompt = "Введите сумму портфеля в рублях.\n\nНапример: 300000"
@@ -503,6 +536,7 @@ async def receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Введите корректную сумму больше 0.")
         return AMOUNT
 
+    save_user(update.effective_user)
     context.user_data["amount"] = amount
     await update.message.reply_text(
         f"Сумма: {money(amount)}\n\nТеперь выберите срок:",
@@ -523,7 +557,7 @@ async def receive_term_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         return TERM
 
     years = float(value)
-    await show_result(query, context, years)
+    await show_result(query, context, years, user=update.effective_user)
     return ConversationHandler.END
 
 
@@ -539,7 +573,7 @@ async def receive_custom_term(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Введите срок от 1 до 30 лет.")
         return TERM
 
-    await show_result(update.message, context, years, is_message=True)
+    await show_result(update.message, context, years, is_message=True, user=update.effective_user)
     return ConversationHandler.END
 
 
@@ -548,12 +582,15 @@ async def show_result(
     context: ContextTypes.DEFAULT_TYPE,
     years: float,
     is_message: bool = False,
+    user=None,
 ):
     amount = context.user_data["amount"]
 
     curve_date, curve, is_fallback = get_cbr_curve()
     bond_rate = rate_for_term(years, curve)
     result = calculate_portfolio(amount, years, bond_rate)
+    save_user(user)
+    record_calculation(user, amount, years, bond_rate)
 
     years_text = f"{years:g}".replace(".", ",")
     rate_text = pct(bond_rate)
@@ -601,6 +638,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
          InlineKeyboardButton("👥 Пользователи", callback_data="admin:users")],
+        [InlineKeyboardButton("📈 Расчёты", callback_data="admin:calculations")],
         [InlineKeyboardButton("🔄 Обновить", callback_data="admin:menu")],
     ])
 
@@ -671,6 +709,37 @@ async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "Последняя регистрация (UTC): "
                         f"{latest.strftime('%d.%m.%Y %H:%M') if latest else 'Нет данных'}"
                     )
+                elif action == "calculations":
+                    cur.execute("""
+                        SELECT COUNT(*),
+                               COUNT(*) FILTER (WHERE calculated_at >= NOW() - INTERVAL '7 days'),
+                               COUNT(DISTINCT user_id),
+                               AVG(amount)
+                        FROM portfolio_calculations
+                    """)
+                    total, week, unique_users, avg_amount = cur.fetchone()
+                    cur.execute("""
+                        SELECT years, COUNT(*) AS n
+                        FROM portfolio_calculations
+                        GROUP BY years
+                        ORDER BY n DESC, years ASC
+                        LIMIT 5
+                    """)
+                    popular = cur.fetchall()
+                    lines = [
+                        "📈 SVETINVEST | АНАЛИТИКА РАСЧЁТОВ", "",
+                        f"🧮 Всего расчётов: {total}",
+                        f"📅 За последние 7 дней: {week}",
+                        f"👥 Уникальных пользователей: {unique_users}",
+                        f"💰 Средний портфель: {money(float(avg_amount)) if avg_amount is not None else 'Нет данных'}",
+                        "", "⏳ Популярные сроки:",
+                    ]
+                    if popular:
+                        for years_value, n in popular:
+                            lines.append(f"• {float(years_value):g} лет — {n} расч.")
+                    else:
+                        lines.append("Пока нет завершённых расчётов.")
+                    text = "\n".join(lines)
                 elif action == "users":
                     cur.execute("""
                         SELECT username, first_name, joined_at
@@ -725,7 +794,7 @@ def run():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CallbackQueryHandler(admin_action, pattern=r"^admin:(?:menu|stats|users)$"))
+    app.add_handler(CallbackQueryHandler(admin_action, pattern=r"^admin:(?:menu|stats|users|calculations)$"))
     app.add_handler(CallbackQueryHandler(home, pattern=r"^home$"))
     app.add_handler(conversation)
 
