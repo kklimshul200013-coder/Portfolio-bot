@@ -673,6 +673,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ADMIN_USER_ID: Final[int] = 393436657
 
 
+
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
@@ -680,9 +681,9 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📈 Расчёты", callback_data="admin:calculations")],
         [InlineKeyboardButton("🔀 Воронка", callback_data="admin:funnel"),
          InlineKeyboardButton("📅 По дням", callback_data="admin:daily")],
+        [InlineKeyboardButton("📨 Рассылки", callback_data="broadcast:menu")],
         [InlineKeyboardButton("🔄 Обновить", callback_data="admin:menu")],
     ])
-
 
 def admin_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
