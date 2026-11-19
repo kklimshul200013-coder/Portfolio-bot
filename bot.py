@@ -102,6 +102,25 @@ def init_database():
                     CREATE INDEX IF NOT EXISTS idx_portfolio_calculations_date
                     ON portfolio_calculations (calculated_at)
                 """)
+        with psycopg.connect(DATABASE_URL, connect_timeout=10) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_events (
+                        id BIGSERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        calculator TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        CONSTRAINT bot_events_event_type_check CHECK (
+                            event_type IN ('opened', 'started', 'completed')
+                        )
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_bot_events_type_date
+                    ON bot_events (calculator, event_type, created_at)
+                """)
+        logger.info("Таблица bot_events готова")
         logger.info("Таблица portfolio_calculations готова")
         logger.info("Таблица bot_users готова")
     except Exception:
@@ -142,6 +161,23 @@ def record_calculation(user, amount: float, years: float, bond_rate: float):
                 """, (user.id, amount, years, bond_rate))
     except Exception:
         logger.exception("Ошибка сохранения расчёта")
+
+
+def record_event(user, calculator: str, event_type: str):
+    """Универсальные события для нынешних и будущих калькуляторов."""
+    if not DATABASE_URL or user is None:
+        return
+    if event_type not in ("opened", "started", "completed"):
+        return
+    try:
+        with psycopg.connect(DATABASE_URL, connect_timeout=10) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO bot_events (user_id, calculator, event_type)
+                    VALUES (%s, %s, %s)
+                """, (user.id, calculator, event_type))
+    except Exception:
+        logger.exception("Ошибка записи аналитического события")
 
 
 def money(value: float) -> str:
@@ -513,6 +549,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def begin_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
+    record_event(update.effective_user, "portfolio", "opened")
     query = update.callback_query
     await query.answer()
     prompt = "Введите сумму портфеля в рублях.\n\nНапример: 300000"
@@ -538,6 +575,7 @@ async def receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     save_user(update.effective_user)
     context.user_data["amount"] = amount
+    record_event(update.effective_user, "portfolio", "started")
     await update.message.reply_text(
         f"Сумма: {money(amount)}\n\nТеперь выберите срок:",
         reply_markup=term_keyboard(),
@@ -591,6 +629,7 @@ async def show_result(
     result = calculate_portfolio(amount, years, bond_rate)
     save_user(user)
     record_calculation(user, amount, years, bond_rate)
+    record_event(user, "portfolio", "completed")
 
     years_text = f"{years:g}".replace(".", ",")
     rate_text = pct(bond_rate)
@@ -639,6 +678,8 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
          InlineKeyboardButton("👥 Пользователи", callback_data="admin:users")],
         [InlineKeyboardButton("📈 Расчёты", callback_data="admin:calculations")],
+        [InlineKeyboardButton("🔀 Воронка", callback_data="admin:funnel"),
+         InlineKeyboardButton("📅 По дням", callback_data="admin:daily")],
         [InlineKeyboardButton("🔄 Обновить", callback_data="admin:menu")],
     ])
 
@@ -740,6 +781,63 @@ async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         lines.append("Пока нет завершённых расчётов.")
                     text = "\n".join(lines)
+                elif action == "funnel":
+                    cur.execute("""
+                        SELECT event_type, COUNT(DISTINCT user_id)
+                        FROM bot_events
+                        WHERE calculator = 'portfolio'
+                        GROUP BY event_type
+                    """)
+                    counts = dict(cur.fetchall())
+                    opened = counts.get("opened", 0)
+                    started = counts.get("started", 0)
+                    completed = counts.get("completed", 0)
+                    cur.execute("SELECT COUNT(*) FROM bot_users")
+                    registered = cur.fetchone()[0]
+                    def conversion(part, whole):
+                        return f"{100 * part / whole:.1f}%" if whole else "—"
+                    text = (
+                        "🔀 SVETINVEST | ВОРОНКА ПОРТФЕЛЯ\n\n"
+                        f"👥 Зарегистрировано: {registered}\n"
+                        f"📲 Открыли калькулятор: {opened}\n"
+                        f"✏️ Ввели сумму: {started}\n"
+                        f"✅ Получили результат: {completed}\n\n"
+                        f"Конверсия открытие → результат: {conversion(completed, opened)}\n\n"
+                        "Учитываются уникальные пользователи на каждом этапе. "
+                        "События записываются с момента установки обновления. "
+                        "Этапы могут относиться к разным сессиям."
+                    )
+                elif action == "daily":
+                    cur.execute("""
+                        WITH days AS (
+                            SELECT generate_series(
+                                CURRENT_DATE - INTERVAL '6 days',
+                                CURRENT_DATE, INTERVAL '1 day'
+                            )::date AS day
+                        ), registrations AS (
+                            SELECT (joined_at AT TIME ZONE 'UTC')::date AS day, COUNT(*) AS n
+                            FROM bot_users
+                            WHERE joined_at >= (CURRENT_DATE - INTERVAL '6 days')
+                            GROUP BY 1
+                        ), calculations AS (
+                            SELECT (calculated_at AT TIME ZONE 'UTC')::date AS day, COUNT(*) AS n
+                            FROM portfolio_calculations
+                            WHERE calculated_at >= (CURRENT_DATE - INTERVAL '6 days')
+                            GROUP BY 1
+                        )
+                        SELECT days.day, COALESCE(registrations.n, 0),
+                               COALESCE(calculations.n, 0)
+                        FROM days
+                        LEFT JOIN registrations USING (day)
+                        LEFT JOIN calculations USING (day)
+                        ORDER BY days.day DESC
+                    """)
+                    rows = cur.fetchall()
+                    lines = ["📅 SVETINVEST | ПО ДНЯМ (UTC)", "", "Дата | Новые | Расчёты"]
+                    for day, new_users, calc_count in rows:
+                        lines.append(f"{day:%d.%m} | {new_users} | {calc_count}")
+                    lines.append("\nИстория расчётов доступна с момента включения их учёта.")
+                    text = "\n".join(lines)
                 elif action == "users":
                     cur.execute("""
                         SELECT username, first_name, joined_at
@@ -794,7 +892,7 @@ def run():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CallbackQueryHandler(admin_action, pattern=r"^admin:(?:menu|stats|users|calculations)$"))
+    app.add_handler(CallbackQueryHandler(admin_action, pattern=r"^admin:(?:menu|stats|users|calculations|funnel|daily)$"))
     app.add_handler(CallbackQueryHandler(home, pattern=r"^home$"))
     app.add_handler(conversation)
 
