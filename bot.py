@@ -594,50 +594,109 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Расчёт отменён.", reply_markup=main_keyboard())
     return ConversationHandler.END
 
+ADMIN_USER_ID: Final[int] = 393436657
+
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
+         InlineKeyboardButton("👥 Пользователи", callback_data="admin:users")],
+        [InlineKeyboardButton("🔄 Обновить", callback_data="admin:menu")],
+    ])
+
+
+def admin_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ В админ-панель", callback_data="admin:menu")]
+    ])
+
+
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Доступ только владельцу
-    if not update.effective_user or update.effective_user.id != 393436657:
-        await update.message.reply_text("⛔ Доступ запрещён.")
+    if not update.effective_user or update.effective_user.id != ADMIN_USER_ID:
+        if update.callback_query:
+            await update.callback_query.answer("Доступ запрещён", show_alert=True)
+        elif update.message:
+            await update.message.reply_text("⛔ Доступ запрещён.")
         return
 
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await query.edit_message_text(
+            "🛡 SVETINVEST | АДМИН-ПАНЕЛЬ\n\nВыберите раздел:",
+            reply_markup=admin_keyboard(),
+        )
+    else:
+        await update.message.reply_text(
+            "🛡 SVETINVEST | АДМИН-ПАНЕЛЬ\n\nВыберите раздел:",
+            reply_markup=admin_keyboard(),
+        )
+
+
+async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not update.effective_user or update.effective_user.id != ADMIN_USER_ID:
+        await query.answer("Доступ запрещён", show_alert=True)
+        return
+
+    action = query.data.split(":", 1)[1]
+    if action == "menu":
+        await admin_panel(update, context)
+        return
+
+    await query.answer()
     if not DATABASE_URL:
-        await update.message.reply_text("База данных не подключена.")
+        await query.edit_message_text("База данных не подключена.", reply_markup=admin_back_keyboard())
         return
 
     try:
-        with psycopg.connect(DATABASE_URL) as conn:
+        with psycopg.connect(DATABASE_URL, connect_timeout=10) as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT
-                        COUNT(*),
-                        COUNT(*) FILTER (
-                            WHERE joined_at >= CURRENT_DATE
-                        ),
-                        COUNT(*) FILTER (
-                            WHERE joined_at >= NOW() - INTERVAL '7 days'
-                        ),
-                        COUNT(*) FILTER (
-                            WHERE last_active_at >= NOW() - INTERVAL '7 days'
-                        ),
-                        MAX(joined_at)
-                    FROM bot_users
-                """)
-                total, today, week_new, week_active, latest = cur.fetchone()
+                if action == "stats":
+                    cur.execute("""
+                        SELECT COUNT(*),
+                               COUNT(*) FILTER (WHERE joined_at >= CURRENT_DATE),
+                               COUNT(*) FILTER (WHERE joined_at >= NOW() - INTERVAL '7 days'),
+                               COUNT(*) FILTER (WHERE last_active_at >= NOW() - INTERVAL '7 days'),
+                               MAX(joined_at)
+                        FROM bot_users
+                    """)
+                    total, today, week_new, week_active, latest = cur.fetchone()
+                    text = (
+                        "📊 SVETINVEST | СТАТИСТИКА\n\n"
+                        f"👥 Всего пользователей: {total}\n"
+                        f"🆕 Новых сегодня: {today}\n"
+                        f"📅 Новых за 7 дней: {week_new}\n"
+                        f"📈 Активных за 7 дней: {week_active}\n\n"
+                        "Последняя регистрация (UTC): "
+                        f"{latest.strftime('%d.%m.%Y %H:%M') if latest else 'Нет данных'}"
+                    )
+                elif action == "users":
+                    cur.execute("""
+                        SELECT username, first_name, joined_at
+                        FROM bot_users ORDER BY joined_at DESC LIMIT 10
+                    """)
+                    rows = cur.fetchall()
+                    lines = ["👥 SVETINVEST | ПОСЛЕДНИЕ 10 ПОЛЬЗОВАТЕЛЕЙ", ""]
+                    if not rows:
+                        lines.append("Пользователей пока нет.")
+                    for idx, (username, first_name, joined_at) in enumerate(rows, 1):
+                        display_name = first_name or "Без имени"
+                        handle = f" (@{username})" if username else ""
+                        date = joined_at.strftime("%d.%m.%Y") if joined_at else "—"
+                        lines.append(f"{idx}. {display_name}{handle} — {date}")
+                    text = "\n".join(lines)
+                else:
+                    text = "Неизвестный раздел."
 
-        text = (
-            "🛡 SVETINVEST | АДМИН-ПАНЕЛЬ\n\n"
-            f"👥 Всего пользователей: {total}\n"
-            f"🆕 Новых сегодня: {today}\n"
-            f"📅 Новых за 7 дней: {week_new}\n"
-            f"📊 Активных за 7 дней: {week_active}\n\n"
-            f"Последняя регистрация: "
-            f"{latest.strftime('%d.%m.%Y %H:%M') if latest else 'Нет данных'}"
-        )
-        await update.message.reply_text(text)
-
+        await query.edit_message_text(text, reply_markup=admin_back_keyboard())
     except Exception:
         logger.exception("Ошибка административной панели")
-        await update.message.reply_text("Не удалось получить статистику.")
+        await query.edit_message_text(
+            "Не удалось получить данные. Проверьте логи Railway.",
+            reply_markup=admin_back_keyboard(),
+        )
+
 
 def run():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -666,6 +725,7 @@ def run():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CallbackQueryHandler(admin_action, pattern=r"^admin:(?:menu|stats|users)$"))
     app.add_handler(CallbackQueryHandler(home, pattern=r"^home$"))
     app.add_handler(conversation)
 
