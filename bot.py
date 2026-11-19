@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import psycopg
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Final
@@ -26,7 +27,7 @@ CBR_SOAP_URL: Final[str] = "https://www.cbr.ru/secinfo/secinfo.asmx"
 CBR_SOAP_ACTION: Final[str] = "http://web.cbr.ru/zcyc_paramsXML"
 CACHE_HOURS: Final[int] = 6
 WELCOME_IMAGE: Final[Path] = Path(__file__).with_name("welcome.jpg")
-
+DATABASE_URL = os.getenv("DATABASE_URL")
 # Точки КБД ОФЗ, публикуемые Банком России
 CBR_TERMS: Final[tuple[float, ...]] = (
     0.25, 0.50, 0.75, 1.00, 2.00, 3.00,
@@ -66,6 +67,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def init_database():
+    """Создаёт таблицу пользователей, если её ещё нет."""
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL не задан — база данных отключена")
+        return
+
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_users (
+                        user_id BIGINT PRIMARY KEY,
+                        username TEXT,
+                        first_name TEXT,
+                        joined_at TIMESTAMPTZ DEFAULT NOW(),
+                        last_active_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+        logger.info("Таблица bot_users готова")
+    except Exception:
+        logger.exception("Ошибка инициализации PostgreSQL")
 
 def money(value: float) -> str:
     return f"{value:,.0f}".replace(",", " ") + " ₽"
@@ -581,5 +604,8 @@ def run():
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
+  
 if __name__ == "__main__":
+    init_database()
     run()
+  
