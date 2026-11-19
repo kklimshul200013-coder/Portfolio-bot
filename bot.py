@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import psycopg
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Final
