@@ -196,6 +196,21 @@ def pct(value: float) -> str:
     return f"{value * 100:.1f}%".replace(".", ",")
 
 
+def years_word(value: float) -> str:
+    """Корректное отображение лет в Telegram (1 год, 2 года, 5 лет)."""
+    number = float(value)
+    if not number.is_integer():
+        return f"{number:g}".replace(".", ",") + " года"
+    years = int(number)
+    if years % 10 == 1 and years % 100 != 11:
+        word = "год"
+    elif 2 <= years % 10 <= 4 and not 12 <= years % 100 <= 14:
+        word = "года"
+    else:
+        word = "лет"
+    return f"{years} {word}"
+
+
 def parse_number(value: str) -> float:
     cleaned = (
         str(value)
@@ -795,11 +810,10 @@ def frequency_name(freq: str) -> str:
 
 
 def format_result(sim: Simulation) -> str:
-    return (f"💰 Капитал после расчётного НДФЛ: {money(sim.final)}\n"
-            f"💳 Собственные взносы: {money(sim.invested)}\n"
-            f"📈 Чистый инвестиционный доход: {money(sim.net_profit)}\n"
-            f"🧾 Расчётный НДФЛ: {money(sim.tax)}\n"
-            f"🛒 В сегодняшних рублях: {money(sim.real)}")
+    """Короткая расшифровка для подписчика — без технических параметров."""
+    return (f"Собственные вложения: {money(sim.invested)}\n"
+            f"Инвестиционный доход: {money(sim.net_profit)}\n"
+            f"В сегодняшних деньгах: {money(sim.real)}")
 
 
 # === конец математического ядра ===
@@ -835,12 +849,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_user(update.effective_user)
     text = (
         "Привет! 👋\n\n"
-        "SVETINVEST — калькуляторы инвестиций и накоплений.\n\n"
-        "📊 Портфель: доли золота, облигаций и акций.\n"
-        "📈 Сложный процент: рост капитала с пополнениями.\n"
-        "🎯 Финансовая цель: сумма, срок или размер взноса.\n"
-        "⏳ Сейчас или позже: сравнение дат начала.\n\n"
-        "Модельные результаты, не гарантия доходности. Выберите инструмент:"
+
+        "Я помогу рассчитать инвестиционный портфель, будущие накопления "
+        "и путь к финансовой цели, а также сравнить разные сроки начала инвестирования.\n\n"
+
+        "📊 Портфель — распределение капитала.\n"
+        "📈 Сложный процент — рост накоплений с пополнениями.\n"
+        "🎯 Финансовая цель — сколько откладывать и когда накоплю.\n"
+        "⏳ Сейчас или позже — сравнение результатов инвестирования.\n\n"
+
+        "Выберите один из пунктов ниже, чтобы начать."
     )
     if update.message:
         with WELCOME_IMAGE.open("rb") as photo:
@@ -942,30 +960,22 @@ async def show_result(
     record_calculation(user, amount, years, bond_rate)
     record_event(user, "portfolio", "completed")
 
-    years_text = f"{years:g}".replace(".", ",")
-    rate_text = pct(bond_rate)
-    coupon_text = pct(coupon_rate)
-
-    data_note = ("⚠️ Резервные/сохранённые данные КБД ОФЗ на " if is_fallback
-                 else "КБД ОФЗ: данные Банка России на ") + curve_date + "."
-
     text = (
-        "📊 СТРУКТУРА ПОРТФЕЛЯ\n\n"
-        f"Сумма: {money(amount)}\n"
-        f"Срок: {years_text} лет\n"
-        f"КБД ОФЗ на срок: {rate_text} годовых\n"
-        f"Расчётный купон условной облигации: {coupon_text} годовых\n"
-        f"Эффективный НДФЛ на купоны: {pct(result['effective_tax'])}\n\n"
-        f"🏆 Золото — {pct(result['funds_pct'])} · {money(result['funds'])}\n"
-        f"📈 Облигации — {pct(result['bonds_pct'])} · {money(result['bonds'])}\n"
-        f"🚀 Акции — {pct(result['stocks_pct'])} · {money(result['stocks'])}\n\n"
-        f"Купоны после расчётного НДФЛ за срок (без реинвеста): {money(result['net_coupons'])}\n"
-        f"{data_note}\n"
-        "Купон определён по КБД для условной облигации по номиналу. "
-        "Налоги других доходов и льготы не учтены.\n\n"
-        "Расчёт носит модельный характер и не является индивидуальной "
-        "инвестиционной рекомендацией."
+        "📊 ВАШ ИНВЕСТИЦИОННЫЙ ПОРТФЕЛЬ\n\n"
+
+        f"Сумма инвестиций: {money(amount)}\n"
+        f"Срок: {years_word(years)}\n\n"
+
+        "РАСПРЕДЕЛЕНИЕ КАПИТАЛА\n\n"
+
+        f"🥇 Золото — {pct(result['funds_pct'])} · {money(result['funds'])}\n"
+        f"🏦 Облигации — {pct(result['bonds_pct'])} · {money(result['bonds'])}\n"
+        f"📈 Акции — {pct(result['stocks_pct'])} · {money(result['stocks'])}\n\n"
+
+        "Расчёт ориентировочный и не является индивидуальной инвестиционной рекомендацией."
     )
+    if is_fallback:
+        text += "\n\n⚠️ Использованы ранее сохранённые данные. Результат может быть менее точным."
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Рассчитать заново", callback_data="calculate")],
@@ -1062,7 +1072,7 @@ async def fin_ask(update, context):
     title = FIN_TITLES[work["kind"]]
     if work.get("custom_pending"):
         await fin_reply(update, context,
-            f"{title}\n\nУкажите собственную доходность в % годовых (до НДФЛ).\n"
+            f"{title}\n\nУкажите ожидаемую доходность в % годовых.\n"
             "Например: 10,5\n\nДопустимый диапазон 0–60%.", fin_cancel_keyboard())
         return
     steps = FIN_STEPS[work["kind"]]
@@ -1082,7 +1092,7 @@ async def fin_ask(update, context):
         return
     if step == "basis":
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("В сегодняшних ценах (с инфляцией)", callback_data="calc:basis:today")],
+            [InlineKeyboardButton("В сегодняшних ценах", callback_data="calc:basis:today")],
             [InlineKeyboardButton("Фиксированная будущая сумма", callback_data="calc:basis:fixed")],
             [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
         ])
@@ -1092,14 +1102,12 @@ async def fin_ask(update, context):
         return
     if step == "rate_mode":
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 Автоматическая модель ЦБ", callback_data="calc:rate:auto")],
-            [InlineKeyboardButton("✏️ Своя доходность", callback_data="calc:rate:custom")],
+            [InlineKeyboardButton("✨ Рассчитать автоматически", callback_data="calc:rate:auto")],
+            [InlineKeyboardButton("✏️ Указать свою доходность", callback_data="calc:rate:custom")],
             [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
         ])
         await fin_reply(update, context,
-            f"{title}\n\nВыберите модель доходности:\n\n"
-            "Автоматически — текущая КБД ОФЗ и сценарная траектория по прогнозу ЦБ.\n"
-            "Своя ставка — постоянная ожидаемая доходность до НДФЛ.", markup)
+            f"{title}\n\nКак рассчитать ожидаемый результат?", markup)
         return
     prompts = {
         "initial": "Введите стартовый капитал в рублях (можно 0).\nНапример: 100000",
@@ -1205,23 +1213,18 @@ async def fin_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if v.get("own_rate") is None:
             curve_date, curve, is_fallback = await asyncio.to_thread(get_cbr_curve)
         else:
-            curve_date, curve, is_fallback = "не используется", FALLBACK_CURVE, False
+            curve_date, curve, is_fallback = "", FALLBACK_CURVE, False
         text = await asyncio.to_thread(fin_calculate_text, kind, v, curve)
     except Exception:
         logger.exception("Ошибка расчёта %s", kind)
         await fin_reply(update, context, "Не удалось выполнить расчёт. Проверьте исходные данные и попробуйте снова.", main_keyboard())
         context.user_data.pop("fin_work", None)
         return
-    if v.get("own_rate") is None:
-        note = ("⚠️ Резервная/устаревшая КБД: " if is_fallback
-                else "КБД ОФЗ на ") + curve_date + ". "
-        note += "Прогнозные ключевые ставки — сценарный ориентир, а не доходность ОФЗ. "
-    else:
-        note = f"Собственная доходность: {pct(v['own_rate'])} годовых до НДФЛ. "
-    suffix = ("\n\n📌 " + note + "Инфляционный прогноз ЦБ: " + MACRO["date"] +
-              ". НДФЛ рассчитан по упрощённой купонной модели. "
-              "Другие доходы, льготы и комиссии не учитываются. "
-              "Результат не гарантирован.")
+    # Методику и технические показатели не выводим. Предупреждение об
+    # использовании резервных данных остаётся видимым для пользователя.
+    suffix = "\n\nСуммы ориентировочные и учитывают расчётные налоги."
+    if is_fallback:
+        suffix += "\n⚠️ Использованы ранее сохранённые данные. Результат может быть менее точным."
     await fin_reply(update, context, text + suffix, fin_result_keyboard())
     record_event(update.effective_user, kind, "completed")
     context.user_data.pop("fin_work", None)
@@ -1229,39 +1232,57 @@ async def fin_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def fin_calculate_text(kind: str, v: dict, curve: dict[float, float],
                        start: date | None = None) -> str:
-    """Не зависит от Telegram: доступен для автономного тестирования."""
+    """Краткие результаты без технических параметров; математика не меняется."""
     today = start or date.today()
     own_rate = v.get("own_rate")
-    if kind == "compound" or kind == "goal_future":
+    if kind in ("compound", "goal_future"):
         end = add_years(today, int(v["years"]))
         sim = simulate_savings(today, end, v["initial"], v["contribution"],
                                v["frequency"], curve, own_rate)
-        return (FIN_TITLES[kind] + "\n\n" +
-                f"Срок: {v['years']} лет. Взнос: {money(v['contribution'])} {frequency_name(v['frequency'])}.\n\n" +
-                format_result(sim))
+        title = "📈 РАСЧЁТ НАКОПЛЕНИЙ" if kind == "compound" else "🎯 СКОЛЬКО НАКОПЛЮ"
+        return (
+            f"{title}\n\n"
+            f"Начальный капитал: {money(v['initial'])}\n"
+            f"Пополнение: {money(v['contribution'])} {frequency_name(v['frequency'])}\n"
+            f"Срок: {years_word(v['years'])}\n\n"
+            f"💰 КАПИТАЛ ЧЕРЕЗ {years_word(v['years']).upper()}\n"
+            f"{money(sim.final)}\n\n"
+            f"{format_result(sim)}"
+        )
     if kind == "goal_save":
         end = add_years(today, int(v["years"]))
         amount, sim = required_contribution(today, end, v["initial"], v["goal"],
                                             v["frequency"], curve, own_rate,
                                             v["basis"] == "today")
-        target_value = v["goal"] * (sim.inflation_factor if v["basis"] == "today" else 1)
-        return (FIN_TITLES[kind] + "\n\n" +
-                f"Цель: {money(v['goal'])} ({'сегодняшние цены' if v['basis'] == 'today' else 'фиксированная сумма'}).\n" +
-                f"К концу срока нужно: {money(target_value)}.\n"
-                f"Срок: {v['years']} лет.\n\n"
-                f"✅ Взнос: {money_kopecks(amount)} {frequency_name(v['frequency'])}\n\n" +
-                format_result(sim))
+        text = (
+            "🎯 ВАША ФИНАНСОВАЯ ЦЕЛЬ\n\n"
+            f"Цель: {money(v['goal'])}\n"
+            f"Начальный капитал: {money(v['initial'])}\n"
+            f"Срок: {years_word(v['years'])}\n\n"
+            "✅ НУЖНО ОТКЛАДЫВАТЬ\n"
+            f"{money_kopecks(amount)} {frequency_name(v['frequency'])}"
+        )
+        if v["basis"] == "today":
+            text += f"\n\nОриентировочная стоимость цели к этому сроку: {money(v['goal'] * sim.inflation_factor)}"
+        return text
     if kind == "goal_when":
         end = add_years(today, MAX_YEARS)
         sim = simulate_savings(today, end, v["initial"], v["contribution"],
                                v["frequency"], curve, own_rate,
                                target=v["goal"], target_today=v["basis"] == "today")
-        state = (f"✅ Цель достигнута: {sim.date:%d.%m.%Y}" if sim.reached
-                 else "⚠️ Цель не достигается в течение 30 лет")
-        return (FIN_TITLES[kind] + "\n\n" +
-                f"Цель: {money(v['goal'])} ({'сегодняшние цены' if v['basis'] == 'today' else 'фиксированная сумма'}).\n" +
-                f"Взнос: {money(v['contribution'])} {frequency_name(v['frequency'])}.\n\n" +
-                state + "\n\n" + format_result(sim))
+        prefix = (
+            "🎯 КОГДА ДОСТИГНУ ЦЕЛИ?\n\n"
+            f"Цель: {money(v['goal'])}"
+            + (" в сегодняшних ценах" if v["basis"] == "today" else "") + "\n"
+            f"Начальный капитал: {money(v['initial'])}\n"
+            f"Пополнение: {money(v['contribution'])} {frequency_name(v['frequency'])}\n\n"
+        )
+        if sim.reached:
+            return prefix + ("📅 ОЖИДАЕМАЯ ДАТА\n"
+                             f"{sim.date:%d.%m.%Y}\n\n"
+                             f"Капитал к этой дате: {money(sim.final)}")
+        return prefix + ("⚠️ При выбранных взносах цель не достигается за 30 лет.\n\n"
+                         f"Ожидаемый капитал через 30 лет: {money(sim.final)}")
     if kind == "delay":
         end = add_years(today, int(v["years"]))
         now = simulate_savings(today, end, v["initial"], v["contribution"],
@@ -1269,16 +1290,19 @@ def fin_calculate_text(kind: str, v: dict, curve: dict[float, float],
         later = simulate_savings(today, end, v["initial"], v["contribution"],
                                  v["frequency"], curve, own_rate,
                                  delay_years=int(v["delay"]))
-        return (FIN_TITLES[kind] + "\n\n" +
-                f"Общий срок: {v['years']} лет. Отложенный старт: через {v['delay']} г.\n"
-                f"Взнос: {money(v['contribution'])} {frequency_name(v['frequency'])}.\n\n"
-                f"✅ Начать сейчас: {money(now.final)}\n"
-                f"⏳ Начать позже: {money(later.final)}\n"
-                f"Разница: {money(now.final - later.final)}\n\n"
-                f"Свои взносы сейчас: {money(now.invested)}\n"
-                f"Свои взносы позже: {money(later.invested)}\n"
-                f"Разница в сегодняшних рублях: {money(now.real - later.real)}\n\n"
-                "Во время ожидания первоначальный капитал хранится без дохода.")
+        return (
+            "⏳ СЕЙЧАС ИЛИ ПОЗЖЕ\n\n"
+            f"Начальный капитал: {money(v['initial'])}\n"
+            f"Пополнение: {money(v['contribution'])} {frequency_name(v['frequency'])}\n"
+            f"Срок сравнения: {years_word(v['years'])}\n"
+            f"Отложенный старт: через {years_word(v['delay'])}\n\n"
+            f"🚀 Начать сейчас: {money(now.final)}\n"
+            f"⏳ Начать позже: {money(later.final)}\n\n"
+            f"💰 РАЗНИЦА: {money(now.final - later.final)}\n"
+            f"Разница в сегодняшних деньгах: {money(now.real - later.real)}\n\n"
+            f"Собственные взносы при старте сейчас: {money(now.invested)}\n"
+            f"При отложенном старте: {money(later.invested)}"
+        )
     raise ValueError("Неизвестный калькулятор")
 
 
