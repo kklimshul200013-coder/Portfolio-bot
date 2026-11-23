@@ -188,6 +188,10 @@ def money(value: float) -> str:
     return f"{value:,.0f}".replace(",", " ") + " ₽"
 
 
+def money_kopecks(value: float) -> str:
+    return f"{value:,.2f}".replace(",", " ").replace(".", ",") + " ₽"
+
+
 def pct(value: float) -> str:
     return f"{value * 100:.1f}%".replace(".", ",")
 
@@ -448,6 +452,7 @@ def get_cbr_curve() -> tuple[str, dict[float, float], bool]:
     except Exception:
         logger.exception("Failed to update CBR SecInfo curve; using cached/fallback data")
         _curve_cache["fetched_at"] = now
+        _curve_cache["is_fallback"] = True
 
     return (
         _curve_cache["date"],
@@ -478,32 +483,335 @@ def rate_for_term(years: float, curve: dict[float, float]) -> float:
     raise ValueError("Не удалось определить ставку для выбранного срока.")
 
 
-def calculate_portfolio(amount: float, years: float, bond_rate: float):
+def calculate_portfolio(amount: float, years: float, coupon_rate: float):
+    """Утверждённая модель: 20% золото, 80% — акции/облигации,
+    облигации с учётом НДФЛ на расчётные купоны без реинвестирования.
     """
-    Сохраняем текущую утверждённую модель:
-    20% — фонды, оставшиеся 80% делятся между облигациями и акциями.
-    Меняется только ставка — теперь она зависит от срока по КБД ОФЗ.
+    return calculate_portfolio_net(amount, years, coupon_rate)
+
+
+# === SVETINVEST: единое математическое ядро, версия 4 ===
+from calendar import isleap, monthrange
+from dataclasses import dataclass
+from datetime import date
+
+# Ставки из прогноза Банка России от 23.10.2026. Проценты за год,
+# midpoint диапазонов, НО НЕ ПРОГНОЗ ДОХОДНОСТИ ОБЛИГАЦИЙ.
+# Источник: https://cbr.ru/content/document/file/198897/forecast_261023.pdf
+# Обновлять после выхода нового прогноза ЦБ. Значения можно изменить через
+# переменную окружения SVETINVEST_MACRO_JSON, пример:
+# {"date":"2026-10-23","rates":{"2027":13,"2028":9.5,"2029":8},
+#  "inflation":{"2026":7.35,"2027":4,"2028":4,"2029":4},"long_run_rate":8,"long_run_inflation":4}
+MACRO_DEFAULT = {
+    "date": "2026-10-23",
+    "rates": {2027: 13.0, 2028: 9.5, 2029: 8.0},
+    "inflation": {2026: 7.35, 2027: 4.0, 2028: 4.0, 2029: 4.0},
+    "long_run_rate": 8.0,
+    "long_run_inflation": 4.0,
+}
+
+
+def load_macro():
+    import json
+    result = {
+        "date": MACRO_DEFAULT["date"],
+        "rates": MACRO_DEFAULT["rates"].copy(),
+        "inflation": MACRO_DEFAULT["inflation"].copy(),
+        "long_run_rate": MACRO_DEFAULT["long_run_rate"],
+        "long_run_inflation": MACRO_DEFAULT["long_run_inflation"],
+    }
+    raw = os.getenv("SVETINVEST_MACRO_JSON", "").strip()
+    if not raw:
+        return result
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict) or "date" not in parsed:
+            raise ValueError("Нужна дата прогноза")
+        result["date"] = str(parsed["date"])
+        for name in ("rates", "inflation"):
+            if name in parsed:
+                result[name] = {int(year): float(value) for year, value in parsed[name].items()}
+        for name in ("long_run_rate", "long_run_inflation"):
+            if name in parsed:
+                result[name] = float(parsed[name])
+        rates = list(result["rates"].values()) + list(result["inflation"].values())
+        rates += [result["long_run_rate"], result["long_run_inflation"]]
+        if not all(0 <= x <= 60 for x in rates):
+            raise ValueError("Ставки вне диапазона 0–60%")
+    except (ValueError, TypeError, KeyError):
+        logger.exception("Некорректная SVETINVEST_MACRO_JSON, используем проверенный прогноз")
+        return MACRO_DEFAULT.copy()
+    return result
+
+
+MACRO = load_macro()
+TAX_THRESHOLD = 2_400_000.0
+TAX_LOW = 0.13
+TAX_HIGH = 0.15
+MAX_YEARS = 30
+
+
+def securities_tax(gross_income: float) -> float:
+    """Расчётная шкала 13/15% по доходу; не учитывает другие источники дохода."""
+    value = max(0.0, gross_income)
+    return TAX_LOW * min(value, TAX_THRESHOLD) + TAX_HIGH * max(0.0, value - TAX_THRESHOLD)
+
+
+def discount_factor(years: float, curve: dict[float, float]) -> float:
+    """Коэффициент дисконтирования с лог-линейной интерполяцией D(t).
+
+    Узлы: D(t_i)=(1+z_i)^(-t_i), промежутки интерполируются по ln(D).
+    Для сроков короче минимального узла — ставка первого узла.
     """
-    funds = amount * FUND_SHARE
-    base = amount - funds
+    points = sorted(curve)
+    if years <= points[0]:
+        return (1 + curve[points[0]]) ** (-years)
+    if years >= points[-1]:
+        return (1 + curve[points[-1]]) ** (-years)
+    for left, right in zip(points, points[1:]):
+        if left <= years <= right:
+            ln_left = -left * math.log1p(curve[left])
+            ln_right = -right * math.log1p(curve[right])
+            part = (years - left) / (right - left)
+            return math.exp(ln_left + part * (ln_right - ln_left))
+    raise ValueError("Не удалось интерполировать КБД")
 
-    bonds = base / (1 + bond_rate * years)
-    stocks = base - bonds
 
+def par_coupon_rate(years: float, curve: dict[float, float]) -> float:
+    """Купон условной облигации по номиналу с полугодовыми платежами.
+
+    Для нецелого числа полугодий последний купон пропорционален длине
+    оставшегося интервала. Дисконтирование — по КБД ОФЗ.
+    """
+    if not (1 <= years <= MAX_YEARS):
+        raise ValueError("Срок должен быть от 1 до 30 лет")
+    payment_dates = []
+    t = 0.0
+    while t + 0.5 < years - 1e-9:
+        t += 0.5
+        payment_dates.append((t, 0.5))
+    payment_dates.append((years, years - t))
+    annuity = sum(period * discount_factor(pay_date, curve)
+                  for pay_date, period in payment_dates)
+    if annuity <= 0:
+        raise ValueError("Невозможно построить купонную ставку")
+    return max(0.0, (1.0 - discount_factor(years, curve)) / annuity)
+
+
+def calculate_portfolio_net(amount: float, years: float, coupon_rate: float) -> dict:
+    """B = 0.8P/[1+C(1-N)*T], N — эффективный НДФЛ на купоны.
+
+    Прогрессивность налога делает N зависимой от B. Решение — бисекция:
+      B + T*(B*C - securities_tax(B*C)) = 0.8P
+    Не реинвестирует купоны, не учитывает налоги других инструментов.
+    """
+    base = amount * (1 - FUND_SHARE)
+    left, right = 0.0, base
+    for _ in range(65):
+        bonds = (left + right) / 2.0
+        gross_coupon = bonds * coupon_rate
+        net_coupon = gross_coupon - securities_tax(gross_coupon)
+        if bonds + years * net_coupon > base:
+            right = bonds
+        else:
+            left = bonds
+    bonds = (left + right) / 2.0
+    gross_coupon = bonds * coupon_rate
+    effective_tax = securities_tax(gross_coupon) / gross_coupon if gross_coupon else 0.0
     return {
-        "funds": funds,
+        "funds": amount * FUND_SHARE,
         "bonds": bonds,
-        "stocks": stocks,
-        "funds_pct": funds / amount,
+        "stocks": base - bonds,
+        "funds_pct": FUND_SHARE,
         "bonds_pct": bonds / amount,
-        "stocks_pct": stocks / amount,
+        "stocks_pct": (base - bonds) / amount,
+        "coupon_rate": coupon_rate,
+        "effective_tax": effective_tax,
+        "net_coupons": years * (gross_coupon - securities_tax(gross_coupon)),
     }
 
 
+def add_months(d: date, count: int) -> date:
+    year = d.year + (d.month - 1 + count) // 12
+    month = (d.month - 1 + count) % 12 + 1
+    return date(year, month, min(d.day, monthrange(year, month)[1]))
+
+
+def add_years(d: date, count: int) -> date:
+    return date(d.year + count, d.month, min(d.day, monthrange(d.year + count, d.month)[1]))
+
+
+def payment_dates(start: date, end: date, frequency: str) -> set[date]:
+    """Взносы в конце периода, календарные месяцы — с якорем на начальную дату."""
+    if frequency not in ("daily", "weekly", "biweekly", "monthly"):
+        raise ValueError("Некорректная периодичность")
+    dates = set()
+    if frequency == "monthly":
+        n = 1
+        while True:
+            due = add_months(start, n)
+            if due > end:
+                break
+            dates.add(due)
+            n += 1
+    else:
+        delta = {"daily": 1, "weekly": 7, "biweekly": 14}[frequency]
+        due = start + timedelta(days=delta)
+        while due <= end:
+            dates.add(due)
+            due += timedelta(days=delta)
+    return dates
+
+
+@dataclass
+class Simulation:
+    final: float
+    invested: float
+    tax: float
+    inflation_factor: float
+    date: date
+    reached: bool = False
+
+    @property
+    def real(self):
+        return self.final / self.inflation_factor
+
+    @property
+    def net_profit(self):
+        return self.final - self.invested
+
+
+def bond_proxy_rate(day: date, started: date, curve: dict[float, float],
+                    own_rate: float | None) -> float:
+    """Оценка доходности одногодичных перекладок, не обещание дохода.
+
+    КБД ОФЗ 1 год — рыночный ориентир текущего периода;
+    будущие годы — середины прогноза СТАВКИ ЦБ как сценарные приближения,
+    после горизонта ЦБ — допущение о нейтральном уровне (по умолчанию 8%).
+    Ставка ЦБ и доходность облигаций не тождественны: эту разницу явно
+    поясняем пользователю. Здесь нет попытки выдать макропрогноз за котировку.
+    """
+    if own_rate is not None:
+        return own_rate
+    if day.year == started.year:
+        return rate_for_term(1.0, curve)
+    if day.year in MACRO["rates"]:
+        return MACRO["rates"][day.year] / 100.0
+    return MACRO["long_run_rate"] / 100.0
+
+
+def modeled_inflation(year: int) -> float:
+    return MACRO["inflation"].get(year, MACRO["long_run_inflation"]) / 100.0
+
+
+def simulate_savings(start: date, end: date, initial: float, contribution: float,
+                     frequency: str, curve: dict[float, float],
+                     own_rate: float | None = None, delay_years: int = 0,
+                     target: float | None = None, target_today: bool = True) -> Simulation:
+    """Календарный расчёт с условным ежедневным начислением после модельного НДФЛ.
+
+    Допущения: доход условного облигационного портфеля полностью является
+    облагаемым купонным доходом, налог учитывается по календарным годам,
+    нет комиссий и персональных льгот. Реальные выплаты купонов могут быть
+    полугодовыми; это приближённый, а не налоговый расчёт.
+    """
+    if end <= start:
+        raise ValueError("Конечная дата должна быть позже начала")
+    investment_start = add_years(start, delay_years)
+    if investment_start > end:
+        raise ValueError("Отложенный старт позже окончания")
+    balance = float(initial)
+    paid = float(initial)
+    taxed = 0.0
+    gross_tax_basis = 0.0
+    current_tax_year = start.year
+    inflation_factor = 1.0
+    due_dates = payment_dates(investment_start, end, frequency)
+    if target is not None and balance >= target:
+        return Simulation(balance, paid, taxed, inflation_factor, start, True)
+    day = start
+    while day < end:
+        day += timedelta(days=1)
+        year_days = 366 if isleap(day.year) else 365
+        inflation_factor *= (1.0 + modeled_inflation(day.year)) ** (1.0 / year_days)
+        if day.year != current_tax_year:
+            gross_tax_basis = 0.0
+            current_tax_year = day.year
+        if day > investment_start:
+            annual_rate = bond_proxy_rate(day, start, curve, own_rate)
+            growth = (1.0 + annual_rate) ** (1.0 / year_days) - 1.0
+            interest = balance * growth
+            next_basis = gross_tax_basis + interest
+            tax = securities_tax(next_basis) - securities_tax(gross_tax_basis)
+            gross_tax_basis = next_basis
+            balance += interest - tax
+            taxed += tax
+        if day in due_dates:
+            balance += contribution
+            paid += contribution
+        if target is not None:
+            goal = target * (inflation_factor if target_today else 1.0)
+            if balance + 1e-8 >= goal:
+                return Simulation(balance, paid, taxed, inflation_factor, day, True)
+    return Simulation(balance, paid, taxed, inflation_factor, end, False)
+
+
+def required_contribution(start: date, end: date, initial: float, goal: float,
+                          frequency: str, curve: dict[float, float],
+                          own_rate: float | None, target_today: bool) -> tuple[float, Simulation]:
+    """Бисекция для динамической доходности и реальных дат. Взнос вверх до 1 коп."""
+    kwargs = dict(start=start, end=end, initial=initial, frequency=frequency,
+                  curve=curve, own_rate=own_rate)
+    zero = simulate_savings(contribution=0.0, **kwargs)
+    target_nominal = goal * (zero.inflation_factor if target_today else 1.0)
+    if zero.final >= target_nominal:
+        return 0.0, zero
+    left, right = 0.0, max(1.0, goal)
+    for _ in range(50):
+        probe = simulate_savings(contribution=right, **kwargs)
+        if probe.final >= target_nominal:
+            break
+        right *= 2.0
+        if right > 1e12:
+            raise ValueError("Слишком большая целевая сумма")
+    for _ in range(36):
+        middle = (left + right) / 2.0
+        if simulate_savings(contribution=middle, **kwargs).final >= target_nominal:
+            right = middle
+        else:
+            left = middle
+    result = math.ceil((right + 1e-9) * 100) / 100
+    # Проверка, что округлённый взнос действительно достигает цели.
+    simulation = simulate_savings(contribution=result, **kwargs)
+    if simulation.final + 1e-7 < target_nominal:
+        result += 0.01
+        simulation = simulate_savings(contribution=result, **kwargs)
+    return result, simulation
+
+
+def frequency_name(freq: str) -> str:
+    return {"daily": "ежедневно", "weekly": "еженедельно",
+            "biweekly": "раз в 2 недели", "monthly": "ежемесячно"}[freq]
+
+
+def format_result(sim: Simulation) -> str:
+    return (f"💰 Капитал после расчётного НДФЛ: {money(sim.final)}\n"
+            f"💳 Собственные взносы: {money(sim.invested)}\n"
+            f"📈 Чистый инвестиционный доход: {money(sim.net_profit)}\n"
+            f"🧾 Расчётный НДФЛ: {money(sim.tax)}\n"
+            f"🛒 В сегодняшних рублях: {money(sim.real)}")
+
+
+# === конец математического ядра ===
+
+
 def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("📊 Рассчитать портфель", callback_data="calculate")]]
-    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Портфель", callback_data="calculate")],
+        [InlineKeyboardButton("📈 Сложный процент", callback_data="tool:compound")],
+        [InlineKeyboardButton("🎯 Финансовая цель", callback_data="tool:goal")],
+        [InlineKeyboardButton("⏳ Сейчас или позже", callback_data="tool:delay")],
+    ])
 
 
 def term_keyboard() -> InlineKeyboardMarkup:
@@ -527,14 +835,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_user(update.effective_user)
     text = (
         "Привет! 👋\n\n"
-        "Я помогу рассчитать доли в модельном инвестиционном портфеле "
-        "с учётом суммы и срока инвестирования.\n\n"
-        "В основе модели — защитная облигационная часть: её расчётная "
-        "доходность учитывается при распределении капитала между "
-        "облигациями, акциями и фондами.\n\n"
-        "Доходность определяется автоматически по актуальной кривой "
-        "бескупонной доходности ОФЗ Банка России.\n\n"
-        "Нажмите кнопку ниже, чтобы начать."
+        "SVETINVEST — калькуляторы инвестиций и накоплений.\n\n"
+        "📊 Портфель: доли золота, облигаций и акций.\n"
+        "📈 Сложный процент: рост капитала с пополнениями.\n"
+        "🎯 Финансовая цель: сумма, срок или размер взноса.\n"
+        "⏳ Сейчас или позже: сравнение дат начала.\n\n"
+        "Модельные результаты, не гарантия доходности. Выберите инструмент:"
     )
     if update.message:
         with WELCOME_IMAGE.open("rb") as photo:
@@ -630,27 +936,33 @@ async def show_result(
 
     curve_date, curve, is_fallback = get_cbr_curve()
     bond_rate = rate_for_term(years, curve)
-    result = calculate_portfolio(amount, years, bond_rate)
+    coupon_rate = par_coupon_rate(years, curve)
+    result = calculate_portfolio(amount, years, coupon_rate)
     save_user(user)
     record_calculation(user, amount, years, bond_rate)
     record_event(user, "portfolio", "completed")
 
     years_text = f"{years:g}".replace(".", ",")
     rate_text = pct(bond_rate)
+    coupon_text = pct(coupon_rate)
 
-    data_note = f"КБД ОФЗ: данные Банка России на {curve_date}."
+    data_note = ("⚠️ Резервные/сохранённые данные КБД ОФЗ на " if is_fallback
+                 else "КБД ОФЗ: данные Банка России на ") + curve_date + "."
 
     text = (
         "📊 СТРУКТУРА ПОРТФЕЛЯ\n\n"
         f"Сумма: {money(amount)}\n"
         f"Срок: {years_text} лет\n"
-        f"Расчётная доходность на выбранный срок: {rate_text} годовых\n\n"
+        f"КБД ОФЗ на срок: {rate_text} годовых\n"
+        f"Расчётный купон условной облигации: {coupon_text} годовых\n"
+        f"Эффективный НДФЛ на купоны: {pct(result['effective_tax'])}\n\n"
         f"🏆 Золото — {pct(result['funds_pct'])} · {money(result['funds'])}\n"
         f"📈 Облигации — {pct(result['bonds_pct'])} · {money(result['bonds'])}\n"
         f"🚀 Акции — {pct(result['stocks_pct'])} · {money(result['stocks'])}\n\n"
-        "ℹ️ Расчётная доходность определяется автоматически на основе "
-        "кривой бескупонной доходности ОФЗ Банка России.\n"
-        f"{data_note}\n\n"
+        f"Купоны после расчётного НДФЛ за срок (без реинвеста): {money(result['net_coupons'])}\n"
+        f"{data_note}\n"
+        "Купон определён по КБД для условной облигации по номиналу. "
+        "Налоги других доходов и льготы не учтены.\n\n"
         "Расчёт носит модельный характер и не является индивидуальной "
         "инвестиционной рекомендацией."
     )
@@ -674,6 +986,317 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Расчёт отменён.", reply_markup=main_keyboard())
     return ConversationHandler.END
 
+# === SVETINVEST: диалоги новых калькуляторов ===
+NEW_CALC_STATE = 20
+FIN_STEPS = {
+    "compound": ["initial", "contribution", "frequency", "years", "rate_mode"],
+    "goal_save": ["goal", "basis", "initial", "years", "frequency", "rate_mode"],
+    "goal_when": ["goal", "basis", "initial", "contribution", "frequency", "rate_mode"],
+    "goal_future": ["initial", "contribution", "frequency", "years", "rate_mode"],
+    "delay": ["initial", "contribution", "frequency", "years", "delay", "rate_mode"],
+}
+FIN_TITLES = {
+    "compound": "📈 СЛОЖНЫЙ ПРОЦЕНТ",
+    "goal_save": "🎯 СКОЛЬКО ОТКЛАДЫВАТЬ",
+    "goal_when": "🎯 КОГДА НАКОПЛЮ",
+    "goal_future": "🎯 СКОЛЬКО НАКОПЛЮ",
+    "delay": "⏳ СЕЙЧАС ИЛИ ПОЗЖЕ",
+}
+
+
+def fin_cancel_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отменить расчёт", callback_data="calc:cancel")],
+    ])
+
+
+def fin_result_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="home")],
+    ])
+
+
+async def fin_reply(update, context, text, markup=None):
+    if update.callback_query:
+        query = update.callback_query
+        if query.message.photo:
+            await query.message.delete()
+            await context.bot.send_message(chat_id=query.message.chat_id, text=text,
+                                           reply_markup=markup)
+        else:
+            await query.edit_message_text(text, reply_markup=markup)
+    else:
+        await update.message.reply_text(text, reply_markup=markup)
+
+
+async def fin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user:
+        return ConversationHandler.END
+    save_user(update.effective_user)
+    query = update.callback_query
+    await query.answer()
+    kind = query.data.split(":", 1)[1]
+    if kind == "goal":
+        context.user_data.pop("fin_work", None)
+        await fin_reply(update, context,
+            "🎯 ФИНАНСОВАЯ ЦЕЛЬ\n\nЧто хотите рассчитать?",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Сколько откладывать?", callback_data="calc:kind:goal_save")],
+                [InlineKeyboardButton("📅 Когда накоплю?", callback_data="calc:kind:goal_when")],
+                [InlineKeyboardButton("📈 Сколько накоплю?", callback_data="calc:kind:goal_future")],
+                [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
+            ]))
+        return NEW_CALC_STATE
+    if kind not in ("compound", "delay"):
+        return ConversationHandler.END
+    context.user_data["fin_work"] = {"kind": kind, "index": 0, "values": {}}
+    record_event(update.effective_user, kind, "opened")
+    await fin_ask(update, context)
+    return NEW_CALC_STATE
+
+
+async def fin_ask(update, context):
+    work = context.user_data.get("fin_work")
+    if not work:
+        return
+    title = FIN_TITLES[work["kind"]]
+    if work.get("custom_pending"):
+        await fin_reply(update, context,
+            f"{title}\n\nУкажите собственную доходность в % годовых (до НДФЛ).\n"
+            "Например: 10,5\n\nДопустимый диапазон 0–60%.", fin_cancel_keyboard())
+        return
+    steps = FIN_STEPS[work["kind"]]
+    if work["index"] >= len(steps):
+        await fin_finish(update, context)
+        return
+    step = steps[work["index"]]
+    if step == "frequency":
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Ежедневно", callback_data="calc:freq:daily"),
+             InlineKeyboardButton("Еженедельно", callback_data="calc:freq:weekly")],
+            [InlineKeyboardButton("Раз в 2 недели", callback_data="calc:freq:biweekly"),
+             InlineKeyboardButton("Ежемесячно", callback_data="calc:freq:monthly")],
+            [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
+        ])
+        await fin_reply(update, context, f"{title}\n\nКак часто будете пополнять счёт?", markup)
+        return
+    if step == "basis":
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("В сегодняшних ценах (с инфляцией)", callback_data="calc:basis:today")],
+            [InlineKeyboardButton("Фиксированная будущая сумма", callback_data="calc:basis:fixed")],
+            [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
+        ])
+        await fin_reply(update, context,
+            f"{title}\n\nЦель указана в сегодняшних ценах или как фиксированная сумма в будущем?",
+            markup)
+        return
+    if step == "rate_mode":
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Автоматическая модель ЦБ", callback_data="calc:rate:auto")],
+            [InlineKeyboardButton("✏️ Своя доходность", callback_data="calc:rate:custom")],
+            [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
+        ])
+        await fin_reply(update, context,
+            f"{title}\n\nВыберите модель доходности:\n\n"
+            "Автоматически — текущая КБД ОФЗ и сценарная траектория по прогнозу ЦБ.\n"
+            "Своя ставка — постоянная ожидаемая доходность до НДФЛ.", markup)
+        return
+    prompts = {
+        "initial": "Введите стартовый капитал в рублях (можно 0).\nНапример: 100000",
+        "contribution": "Введите сумму одного регулярного пополнения в рублях (можно 0).\nНапример: 10000",
+        "goal": "Введите целевую сумму в рублях.\nНапример: 3000000",
+        "years": "Введите срок инвестирования от 1 до 30 лет (целое число).\nНапример: 10",
+        "delay": "Через сколько лет начнёте инвестировать во втором сценарии?",
+    }
+    if step == "delay":
+        prompts[step] += f"\nЦелое число от 1 до {int(work['values']['years']) - 1}."
+    await fin_reply(update, context, f"{title}\n\n{prompts[step]}", fin_cancel_keyboard())
+
+
+async def fin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    work = context.user_data.get("fin_work")
+    if not work:
+        await update.message.reply_text("Начните новый расчёт из главного меню.", reply_markup=main_keyboard())
+        return ConversationHandler.END
+    try:
+        value = parse_number(update.message.text)
+        if not math.isfinite(value):
+            raise ValueError
+        if work.get("custom_pending"):
+            if not 0 <= value <= 60:
+                raise ValueError
+            work["values"]["own_rate"] = value / 100.0
+            work["custom_pending"] = False
+            await fin_finish(update, context)
+            return ConversationHandler.END
+        step = FIN_STEPS[work["kind"]][work["index"]]
+        if step in ("goal", "initial", "contribution"):
+            if value < 0 or value > 1_000_000_000_000 or (step == "goal" and value <= 0):
+                raise ValueError
+        elif step == "years":
+            if int(value) != value or not 1 <= value <= MAX_YEARS:
+                raise ValueError
+            if work["kind"] == "delay" and value < 2:
+                raise ValueError
+            value = int(value)
+        elif step == "delay":
+            if int(value) != value or not 1 <= value < work["values"]["years"]:
+                raise ValueError
+            value = int(value)
+        else:
+            raise ValueError
+    except (ValueError, OverflowError):
+        await update.message.reply_text("Введите корректное число в указанном диапазоне.")
+        return NEW_CALC_STATE
+
+    work["values"][step] = value
+    if work["index"] == 0:
+        record_event(update.effective_user, work["kind"], "started")
+    work["index"] += 1
+    await fin_ask(update, context)
+    return NEW_CALC_STATE if context.user_data.get("fin_work") else ConversationHandler.END
+
+
+async def fin_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    payload = query.data.split(":")
+    if payload[1] == "cancel":
+        context.user_data.pop("fin_work", None)
+        await fin_reply(update, context, "Расчёт отменён.", main_keyboard())
+        return ConversationHandler.END
+    if payload[1] == "kind":
+        kind = payload[2]
+        if kind not in FIN_STEPS or not kind.startswith("goal_"):
+            return ConversationHandler.END
+        context.user_data["fin_work"] = {"kind": kind, "index": 0, "values": {}}
+        record_event(update.effective_user, kind, "opened")
+        await fin_ask(update, context)
+        return NEW_CALC_STATE
+    work = context.user_data.get("fin_work")
+    if not work:
+        await fin_reply(update, context, "Начните новый расчёт.", main_keyboard())
+        return ConversationHandler.END
+    expected = FIN_STEPS[work["kind"]][work["index"]]
+    if payload[1] == "freq" and expected == "frequency" and payload[2] in ("daily", "weekly", "biweekly", "monthly"):
+        work["values"]["frequency"] = payload[2]
+    elif payload[1] == "basis" and expected == "basis" and payload[2] in ("today", "fixed"):
+        work["values"]["basis"] = payload[2]
+    elif payload[1] == "rate" and expected == "rate_mode" and payload[2] in ("auto", "custom"):
+        work["values"]["own_rate"] = None
+        if payload[2] == "custom":
+            work["custom_pending"] = True
+    else:
+        await fin_reply(update, context,
+                        "Параметр не соответствует текущему шагу. Продолжите расчёт.",
+                        fin_cancel_keyboard())
+        return NEW_CALC_STATE
+    work["index"] += 1
+    await fin_ask(update, context)
+    return NEW_CALC_STATE if context.user_data.get("fin_work") else ConversationHandler.END
+
+
+async def fin_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    work = context.user_data.get("fin_work")
+    if not work:
+        return
+    kind, v = work["kind"], work["values"]
+    try:
+        if v.get("own_rate") is None:
+            curve_date, curve, is_fallback = await asyncio.to_thread(get_cbr_curve)
+        else:
+            curve_date, curve, is_fallback = "не используется", FALLBACK_CURVE, False
+        text = await asyncio.to_thread(fin_calculate_text, kind, v, curve)
+    except Exception:
+        logger.exception("Ошибка расчёта %s", kind)
+        await fin_reply(update, context, "Не удалось выполнить расчёт. Проверьте исходные данные и попробуйте снова.", main_keyboard())
+        context.user_data.pop("fin_work", None)
+        return
+    if v.get("own_rate") is None:
+        note = ("⚠️ Резервная/устаревшая КБД: " if is_fallback
+                else "КБД ОФЗ на ") + curve_date + ". "
+        note += "Прогнозные ключевые ставки — сценарный ориентир, а не доходность ОФЗ. "
+    else:
+        note = f"Собственная доходность: {pct(v['own_rate'])} годовых до НДФЛ. "
+    suffix = ("\n\n📌 " + note + "Инфляционный прогноз ЦБ: " + MACRO["date"] +
+              ". НДФЛ рассчитан по упрощённой купонной модели. "
+              "Другие доходы, льготы и комиссии не учитываются. "
+              "Результат не гарантирован.")
+    await fin_reply(update, context, text + suffix, fin_result_keyboard())
+    record_event(update.effective_user, kind, "completed")
+    context.user_data.pop("fin_work", None)
+
+
+def fin_calculate_text(kind: str, v: dict, curve: dict[float, float],
+                       start: date | None = None) -> str:
+    """Не зависит от Telegram: доступен для автономного тестирования."""
+    today = start or date.today()
+    own_rate = v.get("own_rate")
+    if kind == "compound" or kind == "goal_future":
+        end = add_years(today, int(v["years"]))
+        sim = simulate_savings(today, end, v["initial"], v["contribution"],
+                               v["frequency"], curve, own_rate)
+        return (FIN_TITLES[kind] + "\n\n" +
+                f"Срок: {v['years']} лет. Взнос: {money(v['contribution'])} {frequency_name(v['frequency'])}.\n\n" +
+                format_result(sim))
+    if kind == "goal_save":
+        end = add_years(today, int(v["years"]))
+        amount, sim = required_contribution(today, end, v["initial"], v["goal"],
+                                            v["frequency"], curve, own_rate,
+                                            v["basis"] == "today")
+        target_value = v["goal"] * (sim.inflation_factor if v["basis"] == "today" else 1)
+        return (FIN_TITLES[kind] + "\n\n" +
+                f"Цель: {money(v['goal'])} ({'сегодняшние цены' if v['basis'] == 'today' else 'фиксированная сумма'}).\n" +
+                f"К концу срока нужно: {money(target_value)}.\n"
+                f"Срок: {v['years']} лет.\n\n"
+                f"✅ Взнос: {money_kopecks(amount)} {frequency_name(v['frequency'])}\n\n" +
+                format_result(sim))
+    if kind == "goal_when":
+        end = add_years(today, MAX_YEARS)
+        sim = simulate_savings(today, end, v["initial"], v["contribution"],
+                               v["frequency"], curve, own_rate,
+                               target=v["goal"], target_today=v["basis"] == "today")
+        state = (f"✅ Цель достигнута: {sim.date:%d.%m.%Y}" if sim.reached
+                 else "⚠️ Цель не достигается в течение 30 лет")
+        return (FIN_TITLES[kind] + "\n\n" +
+                f"Цель: {money(v['goal'])} ({'сегодняшние цены' if v['basis'] == 'today' else 'фиксированная сумма'}).\n" +
+                f"Взнос: {money(v['contribution'])} {frequency_name(v['frequency'])}.\n\n" +
+                state + "\n\n" + format_result(sim))
+    if kind == "delay":
+        end = add_years(today, int(v["years"]))
+        now = simulate_savings(today, end, v["initial"], v["contribution"],
+                               v["frequency"], curve, own_rate)
+        later = simulate_savings(today, end, v["initial"], v["contribution"],
+                                 v["frequency"], curve, own_rate,
+                                 delay_years=int(v["delay"]))
+        return (FIN_TITLES[kind] + "\n\n" +
+                f"Общий срок: {v['years']} лет. Отложенный старт: через {v['delay']} г.\n"
+                f"Взнос: {money(v['contribution'])} {frequency_name(v['frequency'])}.\n\n"
+                f"✅ Начать сейчас: {money(now.final)}\n"
+                f"⏳ Начать позже: {money(later.final)}\n"
+                f"Разница: {money(now.final - later.final)}\n\n"
+                f"Свои взносы сейчас: {money(now.invested)}\n"
+                f"Свои взносы позже: {money(later.invested)}\n"
+                f"Разница в сегодняшних рублях: {money(now.real - later.real)}\n\n"
+                "Во время ожидания первоначальный капитал хранится без дохода.")
+    raise ValueError("Неизвестный калькулятор")
+
+
+async def fin_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("fin_work", None)
+    await update.message.reply_text("Расчёт отменён.", reply_markup=main_keyboard())
+    return ConversationHandler.END
+
+
+async def fin_cancel_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("fin_work", None)
+    await home(update, context)
+    return ConversationHandler.END
+
+
+# === конец диалогов ===
+
+
 ADMIN_USER_ID: Final[int] = 393436657
 
 
@@ -681,7 +1304,8 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
          InlineKeyboardButton("👥 Пользователи", callback_data="admin:users")],
-        [InlineKeyboardButton("📈 Расчёты", callback_data="admin:calculations")],
+        [InlineKeyboardButton("📈 Расчёты", callback_data="admin:calculations"),
+         InlineKeyboardButton("🧮 По инструментам", callback_data="admin:tools")],
         [InlineKeyboardButton("🔀 Воронка", callback_data="admin:funnel"),
          InlineKeyboardButton("📅 По дням", callback_data="admin:daily")],
         [InlineKeyboardButton("📨 Рассылки", callback_data="broadcast:menu")],
@@ -965,6 +1589,23 @@ async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "События записываются с момента установки обновления. "
                         "Этапы могут относиться к разным сессиям."
                     )
+                elif action == "tools":
+                    cur.execute("""
+                        SELECT calculator,
+                               COUNT(DISTINCT user_id) FILTER (WHERE event_type='opened'),
+                               COUNT(*) FILTER (WHERE event_type='completed'),
+                               COUNT(DISTINCT user_id) FILTER (WHERE event_type='completed')
+                        FROM bot_events
+                        GROUP BY calculator ORDER BY calculator
+                    """)
+                    rows = cur.fetchall()
+                    lines = ["🧮 SVETINVEST | КАЛЬКУЛЯТОРЫ", "",
+                             "Открытия (уник.) / Расчёты / Пользователи"]
+                    for name, opened, completed, people in rows:
+                        lines.append(f"{name}: {opened} / {completed} / {people}")
+                    if not rows:
+                        lines.append("Расчётов пока нет.")
+                    text = "\n".join(lines)
                 elif action == "daily":
                     cur.execute("""
                         WITH days AS (
@@ -1067,11 +1708,26 @@ def run():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CallbackQueryHandler(admin_action, pattern=r"^admin:(?:menu|stats|users|calculations|funnel|daily)$"))
+    app.add_handler(CallbackQueryHandler(admin_action, pattern=r"^admin:(?:menu|stats|users|calculations|funnel|daily|tools)$"))
     app.add_handler(CallbackQueryHandler(broadcast_menu, pattern=r"^broadcast:menu$"))
     app.add_handler(broadcast_conversation)
     app.add_handler(CallbackQueryHandler(home, pattern=r"^home$"))
     app.add_handler(conversation)
+    financial_conversation = ConversationHandler(
+        entry_points=[CallbackQueryHandler(fin_entry, pattern=r"^tool:(?:compound|goal|delay)$")],
+        states={
+            NEW_CALC_STATE: [
+                CallbackQueryHandler(fin_choice, pattern=r"^calc:(?:kind|freq|basis|rate|cancel)(?::.*)?$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, fin_text),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", fin_cancel_command),
+            CallbackQueryHandler(fin_cancel_home, pattern=r"^home$"),
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(financial_conversation)
 
     logger.info("Bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
