@@ -1131,12 +1131,17 @@ async def fin_ask(update, context):
         return
     if step == "basis":
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Учесть рост цен", callback_data="calc:basis:today")],
-            [InlineKeyboardButton("Накопить указанную сумму", callback_data="calc:basis:fixed")],
+            [InlineKeyboardButton("📈 Учесть рост цен", callback_data="calc:basis:today")],
+            [InlineKeyboardButton("🎯 Фиксированная сумма", callback_data="calc:basis:fixed")],
             [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
         ])
+        goal_amount = money(work["values"]["goal"])
         await fin_reply(update, context,
-            f"{title}\n\nНужно ли учитывать рост цен при расчёте цели?",
+            f"{title}\n\nКакую сумму вы хотите накопить?\n\n"
+            f"📈 Учесть рост цен — сейчас ваша цель стоит {goal_amount}. "
+            "Бот рассчитает, сколько понадобится в будущем.\n\n"
+            f"🎯 Фиксированная сумма — накопить ровно {goal_amount}, "
+            "без увеличения цели на рост цен.",
             markup)
         return
     if step == "rate_mode":
@@ -1153,7 +1158,9 @@ async def fin_ask(update, context):
     prompts = {
         "initial": "Введите стартовый капитал в рублях (можно 0).\nНапример: 100000",
         "contribution": "Введите сумму одного регулярного пополнения в рублях (можно 0).\nНапример: 10000",
-        "goal": "Введите целевую сумму в рублях.\nНапример: 3000000",
+        "goal": ("Какую сумму хотите накопить?\n\n"
+                 "Введите стоимость цели в рублях. Например: 3000000.\n"
+                 "На следующем шаге выберем, учитывать ли рост цен."),
         "years": "Введите срок инвестирования от 1 до 30 лет (целое число).\nНапример: 10",
         "delay": "Через сколько лет начнёте инвестировать во втором варианте?",
     }
@@ -1332,35 +1339,56 @@ def fin_calculate_text(kind: str, v: dict, curve: dict[float, float],
         amount, sim = required_contribution(today, end, v["initial"], v["goal"],
                                             v["frequency"], curve, own_rate,
                                             v["basis"] == "today")
-        text = (
-            "🎯 ВАША ФИНАНСОВАЯ ЦЕЛЬ\n\n"
-            f"Цель: {money(v['goal'])}\n"
-            f"Начальный капитал: {money(v['initial'])}\n"
-            f"Срок: {years_word(v['years'])}\n\n"
-            "✅ НУЖНО ОТКЛАДЫВАТЬ\n"
+        if v["basis"] == "today":
+            future_goal = v["goal"] * sim.inflation_factor
+            return (
+                "🎯 СКОЛЬКО ОТКЛАДЫВАТЬ?\n\n"
+                f"Ваша цель в сегодняшних ценах: {money(v['goal'])}\n"
+                f"Срок: {years_word(v['years'])}\n"
+                f"Начальный капитал: {money(v['initial'])}\n\n"
+                f"📈 Через {years_word(v['years'])} с учётом роста цен понадобится:\n"
+                f"{money(future_goal)}\n\n"
+                "✅ ЧТОБЫ НАКОПИТЬ ЭТУ СУММУ, ОТКЛАДЫВАЙТЕ\n"
+                f"{money_kopecks(amount)} {frequency_name(v['frequency'])}"
+            )
+        return (
+            "🎯 СКОЛЬКО ОТКЛАДЫВАТЬ?\n\n"
+            f"Ваша цель: {money(v['goal'])} (фиксированная сумма)\n"
+            f"Срок: {years_word(v['years'])}\n"
+            f"Начальный капитал: {money(v['initial'])}\n\n"
+            "✅ ЧТОБЫ НАКОПИТЬ ЭТУ СУММУ, ОТКЛАДЫВАЙТЕ\n"
             f"{money_kopecks(amount)} {frequency_name(v['frequency'])}"
         )
-        if v["basis"] == "today":
-            text += f"\n\nОриентировочная стоимость цели к этому сроку: {money(v['goal'] * sim.inflation_factor)}"
-        return text
     if kind == "goal_when":
         end = add_years(today, MAX_YEARS)
         sim = simulate_savings(today, end, v["initial"], v["contribution"],
                                v["frequency"], curve, own_rate,
                                target=v["goal"], target_today=v["basis"] == "today")
+        is_today_prices = v["basis"] == "today"
+        target_amount = v["goal"] * sim.inflation_factor if is_today_prices else v["goal"]
         prefix = (
-            "🎯 КОГДА ДОСТИГНУ ЦЕЛИ?\n\n"
-            f"Цель: {money(v['goal'])}"
-            + (" с учётом роста цен" if v["basis"] == "today" else "") + "\n"
-            f"Начальный капитал: {money(v['initial'])}\n"
-            f"Пополнение: {money(v['contribution'])} {frequency_name(v['frequency'])}\n\n"
+            "🎯 КОГДА НАКОПЛЮ?\n\n"
+            + (f"Стоимость вашей цели сегодня: {money(v['goal'])}\n"
+               if is_today_prices
+               else f"Ваша цель: {money(v['goal'])} (фиксированная сумма)\n")
+            + f"Начальный капитал: {money(v['initial'])}\n"
+            + f"Пополнение: {money(v['contribution'])} {frequency_name(v['frequency'])}\n\n"
         )
         if sim.reached:
-            return prefix + ("📅 ОЖИДАЕМАЯ ДАТА\n"
-                             f"{sim.date:%d.%m.%Y}\n\n"
-                             f"Капитал к этой дате: {money(sim.final)}")
-        return prefix + ("⚠️ При выбранных взносах цель не достигается за 30 лет.\n\n"
-                         f"Ожидаемый капитал через 30 лет: {money(sim.final)}")
+            target_text = (
+                f"📈 С учётом роста цен к {sim.date:%d.%m.%Y} потребуется:\n"
+                f"{money(target_amount)}\n\n"
+            ) if is_today_prices else ""
+            return (prefix + target_text
+                    + f"📅 ОЖИДАЕМАЯ ДАТА ДОСТИЖЕНИЯ\n{sim.date:%d.%m.%Y}\n\n"
+                    + f"Ваш капитал к этой дате: {money(sim.final)}")
+        target_text = (
+            f"📈 С учётом роста цен через {MAX_YEARS} лет потребуется:\n"
+            f"{money(target_amount)}\n\n"
+        ) if is_today_prices else ""
+        return (prefix + target_text
+                + f"⚠️ При указанных пополнениях цель не достигается за {MAX_YEARS} лет.\n\n"
+                + f"Расчётный капитал через {MAX_YEARS} лет: {money(sim.final)}")
     if kind == "delay":
         # Оба варианта оцениваются на ОДНУ дату: например, к 60 годам.
         # Первый пополняется весь период, второй — только после задержки.
