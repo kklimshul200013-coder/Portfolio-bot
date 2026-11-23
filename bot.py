@@ -563,7 +563,9 @@ MACRO = load_macro()
 TAX_THRESHOLD = 2_400_000.0
 TAX_LOW = 0.13
 TAX_HIGH = 0.15
-MAX_YEARS = 30
+MAX_YEARS = 30  # Предел сроков КБД и большинства калькуляторов
+MAX_COMPARISON_YEARS = 50  # Общий срок сравнения «Сейчас или позже»
+CUSTOM_RATE_MAX_PCT = 200.0
 
 
 def securities_tax(gross_income: float) -> float:
@@ -813,7 +815,7 @@ def format_result(sim: Simulation) -> str:
     """Короткая расшифровка для подписчика — без технических параметров."""
     return (f"Собственные вложения: {money(sim.invested)}\n"
             f"Инвестиционный доход: {money(sim.net_profit)}\n"
-            f"В сегодняшних деньгах: {money(sim.real)}")
+            f"С учётом инфляции: {money(sim.real)}")
 
 
 # === конец математического ядра ===
@@ -849,15 +851,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_user(update.effective_user)
     text = (
         "Привет! 👋\n\n"
-
         "Я помогу рассчитать инвестиционный портфель, будущие накопления "
         "и путь к финансовой цели, а также сравнить разные сроки начала инвестирования.\n\n"
-
         "📊 Портфель — распределение капитала.\n"
         "📈 Сложный процент — рост накоплений с пополнениями.\n"
         "🎯 Финансовая цель — сколько откладывать и когда накоплю.\n"
         "⏳ Сейчас или позже — сравнение результатов инвестирования.\n\n"
-
         "Выберите один из пунктов ниже, чтобы начать."
     )
     if update.message:
@@ -962,16 +961,12 @@ async def show_result(
 
     text = (
         "📊 ВАШ ИНВЕСТИЦИОННЫЙ ПОРТФЕЛЬ\n\n"
-
         f"Сумма инвестиций: {money(amount)}\n"
         f"Срок: {years_word(years)}\n\n"
-
         "РАСПРЕДЕЛЕНИЕ КАПИТАЛА\n\n"
-
         f"🥇 Золото — {pct(result['funds_pct'])} · {money(result['funds'])}\n"
         f"🏦 Облигации — {pct(result['bonds_pct'])} · {money(result['bonds'])}\n"
         f"📈 Акции — {pct(result['stocks_pct'])} · {money(result['stocks'])}\n\n"
-
         "Расчёт ориентировочный и не является индивидуальной инвестиционной рекомендацией."
     )
     if is_fallback:
@@ -1073,7 +1068,7 @@ async def fin_ask(update, context):
     if work.get("custom_pending"):
         await fin_reply(update, context,
             f"{title}\n\nУкажите ожидаемую доходность в % годовых.\n"
-            "Например: 10,5\n\nДопустимый диапазон 0–60%.", fin_cancel_keyboard())
+            "Например: 10,5\n\nДопустимый диапазон: 0–200%.", fin_cancel_keyboard())
         return
     steps = FIN_STEPS[work["kind"]]
     if work["index"] >= len(steps):
@@ -1092,32 +1087,43 @@ async def fin_ask(update, context):
         return
     if step == "basis":
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("В сегодняшних ценах", callback_data="calc:basis:today")],
-            [InlineKeyboardButton("Фиксированная будущая сумма", callback_data="calc:basis:fixed")],
+            [InlineKeyboardButton("Учесть рост цен", callback_data="calc:basis:today")],
+            [InlineKeyboardButton("Накопить указанную сумму", callback_data="calc:basis:fixed")],
             [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
         ])
         await fin_reply(update, context,
-            f"{title}\n\nЦель указана в сегодняшних ценах или как фиксированная сумма в будущем?",
+            f"{title}\n\nНужно ли учитывать рост цен при расчёте цели?",
             markup)
         return
     if step == "rate_mode":
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✨ Рассчитать автоматически", callback_data="calc:rate:auto")],
+            [InlineKeyboardButton("📊 Прогнозная доходность", callback_data="calc:rate:auto")],
             [InlineKeyboardButton("✏️ Указать свою доходность", callback_data="calc:rate:custom")],
             [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
         ])
         await fin_reply(update, context,
-            f"{title}\n\nКак рассчитать ожидаемый результат?", markup)
+            f"{title}\n\nКакую доходность учитывать?", markup)
         return
     prompts = {
         "initial": "Введите стартовый капитал в рублях (можно 0).\nНапример: 100000",
         "contribution": "Введите сумму одного регулярного пополнения в рублях (можно 0).\nНапример: 10000",
         "goal": "Введите целевую сумму в рублях.\nНапример: 3000000",
         "years": "Введите срок инвестирования от 1 до 30 лет (целое число).\nНапример: 10",
-        "delay": "Через сколько лет начнёте инвестировать во втором сценарии?",
+        "delay": "Через сколько лет начнёте инвестировать во втором варианте?",
     }
+    if step == "years" and work["kind"] == "delay":
+        prompts[step] = (
+            f"Через сколько лет хотите сравнить оба результата? "
+            f"(от 2 до {MAX_COMPARISON_YEARS} лет)\n\n"
+            "Пример: если начинаете в 20 лет и хотите узнать капитал к 60 — введите 40."
+        )
     if step == "delay":
-        prompts[step] += f"\nЦелое число от 1 до {int(work['values']['years']) - 1}."
+        total = int(work["values"]["years"])
+        prompts[step] += (
+            f"\n\nОт 1 до {total - 1} лет. "
+            f"Если начать через 10 лет при общем сроке 40 лет, "
+            f"первый вариант инвестирует 40 лет, второй — 30 лет."
+        )
     await fin_reply(update, context, f"{title}\n\n{prompts[step]}", fin_cancel_keyboard())
 
 
@@ -1131,7 +1137,7 @@ async def fin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not math.isfinite(value):
             raise ValueError
         if work.get("custom_pending"):
-            if not 0 <= value <= 60:
+            if not 0 <= value <= CUSTOM_RATE_MAX_PCT:
                 raise ValueError
             work["values"]["own_rate"] = value / 100.0
             work["custom_pending"] = False
@@ -1142,9 +1148,9 @@ async def fin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if value < 0 or value > 1_000_000_000_000 or (step == "goal" and value <= 0):
                 raise ValueError
         elif step == "years":
-            if int(value) != value or not 1 <= value <= MAX_YEARS:
-                raise ValueError
-            if work["kind"] == "delay" and value < 2:
+            max_years = MAX_COMPARISON_YEARS if work["kind"] == "delay" else MAX_YEARS
+            min_years = 2 if work["kind"] == "delay" else 1
+            if int(value) != value or not min_years <= value <= max_years:
                 raise ValueError
             value = int(value)
         elif step == "delay":
@@ -1273,7 +1279,7 @@ def fin_calculate_text(kind: str, v: dict, curve: dict[float, float],
         prefix = (
             "🎯 КОГДА ДОСТИГНУ ЦЕЛИ?\n\n"
             f"Цель: {money(v['goal'])}"
-            + (" в сегодняшних ценах" if v["basis"] == "today" else "") + "\n"
+            + (" с учётом роста цен" if v["basis"] == "today" else "") + "\n"
             f"Начальный капитал: {money(v['initial'])}\n"
             f"Пополнение: {money(v['contribution'])} {frequency_name(v['frequency'])}\n\n"
         )
@@ -1284,24 +1290,37 @@ def fin_calculate_text(kind: str, v: dict, curve: dict[float, float],
         return prefix + ("⚠️ При выбранных взносах цель не достигается за 30 лет.\n\n"
                          f"Ожидаемый капитал через 30 лет: {money(sim.final)}")
     if kind == "delay":
-        end = add_years(today, int(v["years"]))
+        # Оба варианта оцениваются на ОДНУ дату: например, к 60 годам.
+        # Первый пополняется весь период, второй — только после задержки.
+        # Поэтому его период взносов короче, а не сдвигается конечная дата.
+        total_years = int(v["years"])
+        delay_years = int(v["delay"])
+        if not (2 <= total_years <= MAX_COMPARISON_YEARS and
+                1 <= delay_years < total_years):
+            raise ValueError("Некорректные сроки сравнения")
+        end = add_years(today, total_years)
         now = simulate_savings(today, end, v["initial"], v["contribution"],
                                v["frequency"], curve, own_rate)
         later = simulate_savings(today, end, v["initial"], v["contribution"],
                                  v["frequency"], curve, own_rate,
-                                 delay_years=int(v["delay"]))
+                                 delay_years=delay_years)
+        later_years = total_years - delay_years
         return (
             "⏳ СЕЙЧАС ИЛИ ПОЗЖЕ\n\n"
             f"Начальный капитал: {money(v['initial'])}\n"
             f"Пополнение: {money(v['contribution'])} {frequency_name(v['frequency'])}\n"
-            f"Срок сравнения: {years_word(v['years'])}\n"
-            f"Отложенный старт: через {years_word(v['delay'])}\n\n"
-            f"🚀 Начать сейчас: {money(now.final)}\n"
-            f"⏳ Начать позже: {money(later.final)}\n\n"
-            f"💰 РАЗНИЦА: {money(now.final - later.final)}\n"
-            f"Разница в сегодняшних деньгах: {money(now.real - later.real)}\n\n"
-            f"Собственные взносы при старте сейчас: {money(now.invested)}\n"
-            f"При отложенном старте: {money(later.invested)}"
+            f"Сравниваем через: {years_word(total_years)}\n\n"
+            "🚀 ВАРИАНТ 1. НАЧАТЬ СЕЙЧАС\n"
+            f"Инвестировать: {years_word(total_years)}\n"
+            f"Собственные вложения: {money(now.invested)}\n"
+            f"Инвестиционный доход: {money(now.net_profit)}\n"
+            f"💰 Итоговый капитал: {money(now.final)}\n\n"
+            f"⏳ ВАРИАНТ 2. НАЧАТЬ ЧЕРЕЗ {years_word(delay_years).upper()}\n"
+            f"Инвестировать: {years_word(later_years)}\n"
+            f"Собственные вложения: {money(later.invested)}\n"
+            f"Инвестиционный доход: {money(later.net_profit)}\n"
+            f"💰 Итоговый капитал: {money(later.final)}\n\n"
+            f"📊 РАЗНИЦА: {money(now.final - later.final)}"
         )
     raise ValueError("Неизвестный калькулятор")
 
