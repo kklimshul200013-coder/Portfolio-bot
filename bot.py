@@ -1083,7 +1083,13 @@ async def fin_ask(update, context):
              InlineKeyboardButton("Ежемесячно", callback_data="calc:freq:monthly")],
             [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
         ])
-        await fin_reply(update, context, f"{title}\n\nКак часто будете пополнять счёт?", markup)
+        if work["kind"] == "delay":
+            amount = money(work["values"]["contribution"])
+            question = (f"{title}\n\nШаг 3 из 6\n\n"
+                        f"Как часто будете вносить {amount}?")
+        else:
+            question = f"{title}\n\nКак часто будете пополнять счёт?"
+        await fin_reply(update, context, question, markup)
         return
     if step == "basis":
         markup = InlineKeyboardMarkup([
@@ -1101,8 +1107,10 @@ async def fin_ask(update, context):
             [InlineKeyboardButton("✏️ Указать свою доходность", callback_data="calc:rate:custom")],
             [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
         ])
-        await fin_reply(update, context,
-            f"{title}\n\nКакую доходность учитывать?", markup)
+        question = (f"{title}\n\nШаг 6 из 6\n\n"
+                    "Как рассчитать ожидаемый рост капитала?") if work["kind"] == "delay" else (
+                    f"{title}\n\nКакую доходность учитывать?")
+        await fin_reply(update, context, question, markup)
         return
     prompts = {
         "initial": "Введите стартовый капитал в рублях (можно 0).\nНапример: 100000",
@@ -1111,19 +1119,45 @@ async def fin_ask(update, context):
         "years": "Введите срок инвестирования от 1 до 30 лет (целое число).\nНапример: 10",
         "delay": "Через сколько лет начнёте инвестировать во втором варианте?",
     }
-    if step == "years" and work["kind"] == "delay":
-        prompts[step] = (
-            f"Через сколько лет хотите сравнить оба результата? "
-            f"(от 2 до {MAX_COMPARISON_YEARS} лет)\n\n"
-            "Пример: если начинаете в 20 лет и хотите узнать капитал к 60 — введите 40."
-        )
-    if step == "delay":
-        total = int(work["values"]["years"])
-        prompts[step] += (
-            f"\n\nОт 1 до {total - 1} лет. "
-            f"Если начать через 10 лет при общем сроке 40 лет, "
-            f"первый вариант инвестирует 40 лет, второй — 30 лет."
-        )
+    if work["kind"] == "delay":
+        if step == "initial":
+            prompts[step] = (
+                "Сравним, сколько можно накопить к одной дате, если начать "
+                "инвестировать сейчас или спустя несколько лет.\n\n"
+                "Шаг 1 из 6\n\n"
+                "С какой суммы начнёте?\n\n"
+                "Сумма одинакова для обоих вариантов. "
+                "Если начального капитала нет, введите 0."
+            )
+        elif step == "contribution":
+            prompts[step] = (
+                "Шаг 2 из 6\n\n"
+                "Сколько будете регулярно инвестировать?\n\n"
+                "Введите сумму одного пополнения в рублях. Например: 10000"
+            )
+        elif step == "years":
+            prompts[step] = (
+                "Шаг 4 из 6\n\n"
+                "Через сколько лет хотите узнать результат?\n\n"
+                "Например, сейчас вам 20 лет и вы хотите узнать капитал к 60 — "
+                "введите 40.\n\n"
+                f"Введите целое число от 2 до {MAX_COMPARISON_YEARS}."
+            )
+        elif step == "delay":
+            total = int(work["values"]["years"])
+            prompts[step] = (
+                "Шаг 5 из 6\n\n"
+                "На сколько лет позже начнёте инвестировать во втором варианте?\n\n"
+                "Например: 10.\n"
+                f"Тогда сравним результаты через {total} лет: первый вариант "
+                f"— {total} лет инвестиций, второй — {total - 10} лет.\n\n"
+                f"Введите целое число от 1 до {total - 1}."
+            ) if total > 10 else (
+                "Шаг 5 из 6\n\n"
+                "На сколько лет позже начнёте инвестировать во втором варианте?\n\n"
+                f"Оба результата сравним через {total} лет.\n\n"
+                f"Введите целое число от 1 до {total - 1}."
+            )
     await fin_reply(update, context, f"{title}\n\n{prompts[step]}", fin_cancel_keyboard())
 
 
