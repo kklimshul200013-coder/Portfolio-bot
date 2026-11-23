@@ -821,6 +821,13 @@ def format_result(sim: Simulation) -> str:
 # === конец математического ядра ===
 
 
+def welcome_keyboard() -> InlineKeyboardMarkup:
+    """Отдельная кнопка для перехода с приветствия к калькуляторам."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Начать", callback_data="menu")],
+    ])
+
+
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Портфель", callback_data="calculate")],
@@ -846,32 +853,63 @@ def term_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+WELCOME_TEXT: Final[str] = (
+    "Привет! 👋\n\n"
+    "Я помогу рассчитать инвестиционный портфель, будущие накопления "
+    "и путь к финансовой цели, а также сравнить разные сроки начала инвестирования.\n\n"
+    "📊 Портфель — распределение капитала.\n"
+    "📈 Сложный процент — рост накоплений с пополнениями.\n"
+    "🎯 Финансовая цель — сколько откладывать и когда накоплю.\n"
+    "⏳ Сейчас или позже — сравнение результатов инвестирования.\n\n"
+    "Нажмите «🚀 Начать», чтобы открыть калькуляторы."
+)
+
+MENU_TEXT: Final[str] = (
+    "📊 SVETINVEST | КАЛЬКУЛЯТОРЫ\n\n"
+    "Выберите, что хотите рассчитать:"
+)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приветствие с единственной кнопкой «Начать» по команде /start."""
     if update.effective_user:
         save_user(update.effective_user)
-    text = (
-        "Привет! 👋\n\n"
-        "Я помогу рассчитать инвестиционный портфель, будущие накопления "
-        "и путь к финансовой цели, а также сравнить разные сроки начала инвестирования.\n\n"
-        "📊 Портфель — распределение капитала.\n"
-        "📈 Сложный процент — рост накоплений с пополнениями.\n"
-        "🎯 Финансовая цель — сколько откладывать и когда накоплю.\n"
-        "⏳ Сейчас или позже — сравнение результатов инвестирования.\n\n"
-        "Выберите один из пунктов ниже, чтобы начать."
-    )
     if update.message:
         with WELCOME_IMAGE.open("rb") as photo:
-            await update.message.reply_photo(photo=photo, caption=text, reply_markup=main_keyboard())
+            await update.message.reply_photo(
+                photo=photo, caption=WELCOME_TEXT, reply_markup=welcome_keyboard()
+            )
     else:
+        # Запасной вариант для вызова из callback, если появится такой переход.
         query = update.callback_query
         await query.answer()
-        with WELCOME_IMAGE.open("rb") as photo:
-            if query.message.photo:
-                from telegram import InputMediaPhoto
-                await query.edit_message_media(media=InputMediaPhoto(media=photo, caption=text), reply_markup=main_keyboard())
-            else:
-                await query.message.delete()
-                await context.bot.send_photo(chat_id=query.message.chat_id, photo=photo, caption=text, reply_markup=main_keyboard())
+        if query.message.photo:
+            await query.edit_message_caption(
+                caption=WELCOME_TEXT, reply_markup=welcome_keyboard()
+            )
+        else:
+            await query.edit_message_text(
+                WELCOME_TEXT, reply_markup=welcome_keyboard()
+            )
+
+
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню из четырёх калькуляторов. Приветствие повторно не показываем."""
+    if update.effective_user:
+        save_user(update.effective_user)
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        if query.message.photo:
+            await query.edit_message_caption(
+                caption=MENU_TEXT, reply_markup=main_keyboard()
+            )
+        else:
+            await query.edit_message_text(
+                MENU_TEXT, reply_markup=main_keyboard()
+            )
+    else:
+        await update.message.reply_text(MENU_TEXT, reply_markup=main_keyboard())
 
 
 async def begin_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -984,7 +1022,7 @@ async def show_result(
 
 
 async def home(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await start(update, context)
+    return await show_menu(update, context)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1784,6 +1822,7 @@ def run():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(show_menu, pattern=r"^menu$"))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CallbackQueryHandler(admin_action, pattern=r"^admin:(?:menu|stats|users|calculations|funnel|daily|tools)$"))
     app.add_handler(CallbackQueryHandler(broadcast_menu, pattern=r"^broadcast:menu$"))
