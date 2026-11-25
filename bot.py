@@ -837,6 +837,28 @@ def main_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def menu_button():
+    return InlineKeyboardButton("🏠 Главное меню", callback_data="home")
+
+
+def navigation_keyboard():
+    return InlineKeyboardMarkup([[menu_button()]])
+
+
+def result_keyboard(kind: str):
+    callback = "calculate" if kind == "portfolio" else f"tool:{kind}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Рассчитать заново", callback_data=callback)],
+        [menu_button()],
+    ])
+
+
+def reset_calculation(context):
+    # Do not clear unrelated administrative settings or stored user data.
+    context.user_data.pop("amount", None)
+    context.user_data.pop("fin_work", None)
+
+
 def term_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -850,6 +872,7 @@ def term_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("20 лет", callback_data="term:20"),
         ],
         [InlineKeyboardButton("✏️ Другой срок", callback_data="term:custom")],
+        [menu_button()],
     ])
 
 
@@ -872,6 +895,8 @@ MENU_TEXT: Final[str] = (
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Приветствие с единственной кнопкой «Начать» по команде /start."""
+    reset_calculation(context)
+    context.user_data.pop("broadcast_draft", None)
     if update.effective_user:
         save_user(update.effective_user)
     if update.message:
@@ -891,10 +916,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 WELCOME_TEXT, reply_markup=welcome_keyboard()
             )
+    return ConversationHandler.END
 
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Меню из четырёх калькуляторов. Приветствие повторно не показываем."""
+    reset_calculation(context)
+    context.user_data.pop("broadcast_draft", None)
     if update.effective_user:
         save_user(update.effective_user)
     if update.callback_query:
@@ -910,9 +938,12 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     else:
         await update.message.reply_text(MENU_TEXT, reply_markup=main_keyboard())
+    return ConversationHandler.END
 
 
 async def begin_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_calculation(context)
+    context.user_data.pop("broadcast_draft", None)
     save_user(update.effective_user)
     record_event(update.effective_user, "portfolio", "opened")
     query = update.callback_query
@@ -920,9 +951,9 @@ async def begin_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = "Введите сумму портфеля в рублях.\n\nНапример: 300000"
     if query.message.photo:
         await query.message.delete()
-        await context.bot.send_message(chat_id=query.message.chat_id, text=prompt)
+        await context.bot.send_message(chat_id=query.message.chat_id, text=prompt, reply_markup=navigation_keyboard())
     else:
-        await query.edit_message_text(prompt)
+        await query.edit_message_text(prompt, reply_markup=navigation_keyboard())
     return AMOUNT
 
 
@@ -931,11 +962,11 @@ async def receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = float(raw)
     except ValueError:
-        await update.message.reply_text("Введите сумму числом. Например: 300000")
+        await update.message.reply_text("Введите сумму числом. Например: 300000", reply_markup=navigation_keyboard())
         return AMOUNT
 
-    if amount <= 0 or amount > 1_000_000_000_000:
-        await update.message.reply_text("Введите корректную сумму больше 0.")
+    if not math.isfinite(amount) or amount <= 0 or amount > 1_000_000_000_000:
+        await update.message.reply_text("Введите корректную сумму больше 0.", reply_markup=navigation_keyboard())
         return AMOUNT
 
     save_user(update.effective_user)
@@ -955,12 +986,13 @@ async def receive_term_button(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if value == "custom":
         await query.edit_message_text(
-            "Введите срок в годах от 1 до 30.\n\nНапример: 7"
+            "Введите срок в годах от 1 до 30.\n\nНапример: 7", reply_markup=navigation_keyboard()
         )
         return TERM
 
     years = float(value)
     await show_result(query, context, years, user=update.effective_user)
+    reset_calculation(context)
     return ConversationHandler.END
 
 
@@ -969,14 +1001,15 @@ async def receive_custom_term(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         years = float(raw)
     except ValueError:
-        await update.message.reply_text("Введите срок числом. Например: 7")
+        await update.message.reply_text("Введите срок числом. Например: 7", reply_markup=navigation_keyboard())
         return TERM
 
-    if years < 1 or years > 30:
-        await update.message.reply_text("Введите срок от 1 до 30 лет.")
+    if not math.isfinite(years) or years < 1 or years > 30:
+        await update.message.reply_text("Введите срок от 1 до 30 лет.", reply_markup=navigation_keyboard())
         return TERM
 
     await show_result(update.message, context, years, is_message=True, user=update.effective_user)
+    reset_calculation(context)
     return ConversationHandler.END
 
 
@@ -1010,10 +1043,7 @@ async def show_result(
     if is_fallback:
         text += "\n\n⚠️ Использованы ранее сохранённые данные. Результат может быть менее точным."
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Рассчитать заново", callback_data="calculate")],
-        [InlineKeyboardButton("🏠 В начало", callback_data="home")],
-    ])
+    keyboard = result_keyboard("portfolio")
 
     if is_message:
         await target.reply_text(text, reply_markup=keyboard)
@@ -1026,6 +1056,7 @@ async def home(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_calculation(context)
     await update.message.reply_text("Расчёт отменён.", reply_markup=main_keyboard())
     return ConversationHandler.END
 
@@ -1048,14 +1079,19 @@ FIN_TITLES = {
 
 
 def fin_cancel_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Отменить расчёт", callback_data="calc:cancel")],
-    ])
+    return navigation_keyboard()
 
 
-def fin_result_keyboard():
+def fin_result_keyboard(kind: str):
+    return result_keyboard(kind)
+
+
+def goal_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="home")],
+        [InlineKeyboardButton("💳 Сколько откладывать?", callback_data="calc:kind:goal_save")],
+        [InlineKeyboardButton("📅 Когда накоплю?", callback_data="calc:kind:goal_when")],
+        [InlineKeyboardButton("📈 Сколько накоплю?", callback_data="calc:kind:goal_future")],
+        [menu_button()],
     ])
 
 
@@ -1079,18 +1115,15 @@ async def fin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     kind = query.data.split(":", 1)[1]
+    reset_calculation(context)
+    context.user_data.pop("broadcast_draft", None)
     if kind == "goal":
         context.user_data.pop("fin_work", None)
         await fin_reply(update, context,
             "🎯 ФИНАНСОВАЯ ЦЕЛЬ\n\nЧто хотите рассчитать?",
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Сколько откладывать?", callback_data="calc:kind:goal_save")],
-                [InlineKeyboardButton("📅 Когда накоплю?", callback_data="calc:kind:goal_when")],
-                [InlineKeyboardButton("📈 Сколько накоплю?", callback_data="calc:kind:goal_future")],
-                [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
-            ]))
+            goal_keyboard())
         return NEW_CALC_STATE
-    if kind not in ("compound", "delay"):
+    if kind not in FIN_STEPS:
         return ConversationHandler.END
     context.user_data["fin_work"] = {"kind": kind, "index": 0, "values": {}}
     record_event(update.effective_user, kind, "opened")
@@ -1119,7 +1152,7 @@ async def fin_ask(update, context):
              InlineKeyboardButton("Еженедельно", callback_data="calc:freq:weekly")],
             [InlineKeyboardButton("Раз в 2 недели", callback_data="calc:freq:biweekly"),
              InlineKeyboardButton("Ежемесячно", callback_data="calc:freq:monthly")],
-            [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
+            [menu_button()],
         ])
         if work["kind"] == "delay":
             amount = money(work["values"]["contribution"])
@@ -1133,7 +1166,7 @@ async def fin_ask(update, context):
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("📈 Учесть рост цен", callback_data="calc:basis:today")],
             [InlineKeyboardButton("🎯 Фиксированная сумма", callback_data="calc:basis:fixed")],
-            [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
+            [menu_button()],
         ])
         goal_amount = money(work["values"]["goal"])
         await fin_reply(update, context,
@@ -1148,7 +1181,7 @@ async def fin_ask(update, context):
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Прогнозная доходность", callback_data="calc:rate:auto")],
             [InlineKeyboardButton("✏️ Указать свою доходность", callback_data="calc:rate:custom")],
-            [InlineKeyboardButton("❌ Отменить", callback_data="calc:cancel")],
+            [menu_button()],
         ])
         question = (f"{title}\n\nШаг 6 из 6\n\n"
                     "Как рассчитать ожидаемый рост капитала?") if work["kind"] == "delay" else (
@@ -1209,8 +1242,8 @@ async def fin_ask(update, context):
 async def fin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     work = context.user_data.get("fin_work")
     if not work:
-        await update.message.reply_text("Начните новый расчёт из главного меню.", reply_markup=main_keyboard())
-        return ConversationHandler.END
+        await update.message.reply_text("🎯 ФИНАНСОВАЯ ЦЕЛЬ\n\nВыберите, что хотите рассчитать:", reply_markup=goal_keyboard())
+        return NEW_CALC_STATE
     try:
         value = parse_number(update.message.text)
         if not math.isfinite(value):
@@ -1239,7 +1272,7 @@ async def fin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             raise ValueError
     except (ValueError, OverflowError):
-        await update.message.reply_text("Введите корректное число в указанном диапазоне.")
+        await update.message.reply_text("Введите корректное число в указанном диапазоне.", reply_markup=navigation_keyboard())
         return NEW_CALC_STATE
 
     work["values"][step] = value
@@ -1255,8 +1288,8 @@ async def fin_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     payload = query.data.split(":")
     if payload[1] == "cancel":
-        context.user_data.pop("fin_work", None)
-        await fin_reply(update, context, "Расчёт отменён.", main_keyboard())
+        reset_calculation(context)
+        await fin_reply(update, context, MENU_TEXT, main_keyboard())
         return ConversationHandler.END
     if payload[1] == "kind":
         kind = payload[2]
@@ -1270,6 +1303,9 @@ async def fin_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not work:
         await fin_reply(update, context, "Начните новый расчёт.", main_keyboard())
         return ConversationHandler.END
+    if work.get("custom_pending") or work["index"] >= len(FIN_STEPS[work["kind"]]):
+        await fin_ask(update, context)
+        return NEW_CALC_STATE if context.user_data.get("fin_work") else ConversationHandler.END
     expected = FIN_STEPS[work["kind"]][work["index"]]
     if payload[1] == "freq" and expected == "frequency" and payload[2] in ("daily", "weekly", "biweekly", "monthly"):
         work["values"]["frequency"] = payload[2]
@@ -1302,7 +1338,7 @@ async def fin_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = await asyncio.to_thread(fin_calculate_text, kind, v, curve)
     except Exception:
         logger.exception("Ошибка расчёта %s", kind)
-        await fin_reply(update, context, "Не удалось выполнить расчёт. Проверьте исходные данные и попробуйте снова.", main_keyboard())
+        await fin_reply(update, context, "Не удалось выполнить расчёт. Проверьте исходные данные и попробуйте снова.", fin_result_keyboard(kind))
         context.user_data.pop("fin_work", None)
         return
     # Методику и технические показатели не выводим. Предупреждение об
@@ -1310,7 +1346,7 @@ async def fin_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     suffix = "\n\nСуммы ориентировочные и учитывают расчётные налоги."
     if is_fallback:
         suffix += "\n⚠️ Использованы ранее сохранённые данные. Результат может быть менее точным."
-    await fin_reply(update, context, text + suffix, fin_result_keyboard())
+    await fin_reply(update, context, text + suffix, fin_result_keyboard(kind))
     record_event(update.effective_user, kind, "completed")
     context.user_data.pop("fin_work", None)
 
@@ -1807,6 +1843,94 @@ async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def enter_admin(update, context):
+    if update.effective_user and update.effective_user.id == ADMIN_USER_ID:
+        reset_calculation(context)
+        context.user_data.pop("broadcast_draft", None)
+        await admin_panel(update, context)
+        return ConversationHandler.END
+    await admin_panel(update, context)
+    # Keep current dialogue for a non-admin who invokes /admin.
+    return None
+
+
+async def enter_admin_action(update, context):
+    if update.effective_user and update.effective_user.id == ADMIN_USER_ID:
+        reset_calculation(context)
+        context.user_data.pop("broadcast_draft", None)
+        await admin_action(update, context)
+        return ConversationHandler.END
+    await admin_action(update, context)
+    return None
+
+
+async def enter_broadcast_menu(update, context):
+    if _broadcast_allowed(update):
+        reset_calculation(context)
+        context.user_data.pop("broadcast_draft", None)
+        await broadcast_menu(update, context)
+        return ConversationHandler.END
+    await broadcast_menu(update, context)
+    return None
+
+
+async def enter_broadcast_create(update, context):
+    if _broadcast_allowed(update):
+        reset_calculation(context)
+        return await broadcast_create(update, context)
+    await broadcast_create(update, context)
+    return None
+
+
+async def expired_callback(update, context):
+    # Old buttons after a deployment/restart should not silently stop responding.
+    query = update.callback_query
+    await query.answer("Этот шаг уже завершён. Откройте главное меню.", show_alert=True)
+    if query.data.startswith(("term:", "calc:")):
+        await context.bot.send_message(chat_id=update.effective_chat.id,
+                                       text=MENU_TEXT, reply_markup=main_keyboard())
+
+
+def build_conversation():
+    """One state machine: switching tools always replaces the previous calculation."""
+    return ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            CommandHandler("menu", show_menu),
+            CallbackQueryHandler(show_menu, pattern=r"^(?:menu|home)$"),
+            CallbackQueryHandler(begin_calculation, pattern=r"^calculate$"),
+            CallbackQueryHandler(fin_entry, pattern=r"^tool:(?:compound|goal|goal_save|goal_when|goal_future|delay)$"),
+            CommandHandler("admin", enter_admin),
+            CallbackQueryHandler(enter_admin_action, pattern=r"^admin:(?:menu|stats|users|calculations|funnel|daily|tools)$"),
+            CallbackQueryHandler(enter_broadcast_menu, pattern=r"^broadcast:menu$"),
+            CallbackQueryHandler(enter_broadcast_create, pattern=r"^broadcast:create$"),
+        ],
+        states={
+            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_amount)],
+            TERM: [
+                CallbackQueryHandler(receive_term_button, pattern=r"^term:(?:1|3|5|10|15|20|custom)$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_custom_term),
+            ],
+            NEW_CALC_STATE: [
+                CallbackQueryHandler(fin_choice, pattern=r"^calc:(?:kind:goal_(?:save|when|future)|freq:(?:daily|weekly|biweekly|monthly)|basis:(?:today|fixed)|rate:(?:auto|custom)|cancel)$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, fin_text),
+            ],
+            BROADCAST_TEXT: [
+                CommandHandler("cancel", broadcast_cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_receive_text),
+                CallbackQueryHandler(broadcast_cancel, pattern=r"^broadcast:cancel$"),
+            ],
+            BROADCAST_CONFIRM: [
+                CommandHandler("cancel", broadcast_cancel),
+                CallbackQueryHandler(broadcast_send, pattern=r"^broadcast:send$"),
+                CallbackQueryHandler(broadcast_cancel, pattern=r"^broadcast:cancel$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+
+
 def run():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -1817,61 +1941,8 @@ def run():
 
     app = Application.builder().token(token).build()
 
-    conversation = ConversationHandler(
-        entry_points=[CallbackQueryHandler(begin_calculation, pattern=r"^calculate$")],
-        states={
-            AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_amount)
-            ],
-            TERM: [
-                CallbackQueryHandler(receive_term_button, pattern=r"^term:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_custom_term),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    broadcast_conversation = ConversationHandler(
-        entry_points=[CallbackQueryHandler(broadcast_create, pattern=r"^broadcast:create$")],
-        states={
-            BROADCAST_TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_receive_text),
-                CallbackQueryHandler(broadcast_cancel, pattern=r"^broadcast:cancel$"),
-            ],
-            BROADCAST_CONFIRM: [
-                CallbackQueryHandler(broadcast_send, pattern=r"^broadcast:send$"),
-                CallbackQueryHandler(broadcast_create, pattern=r"^broadcast:create$"),
-                CallbackQueryHandler(broadcast_cancel, pattern=r"^broadcast:cancel$"),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", broadcast_cancel)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(show_menu, pattern=r"^menu$"))
-    app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CallbackQueryHandler(admin_action, pattern=r"^admin:(?:menu|stats|users|calculations|funnel|daily|tools)$"))
-    app.add_handler(CallbackQueryHandler(broadcast_menu, pattern=r"^broadcast:menu$"))
-    app.add_handler(broadcast_conversation)
-    app.add_handler(CallbackQueryHandler(home, pattern=r"^home$"))
-    app.add_handler(conversation)
-    financial_conversation = ConversationHandler(
-        entry_points=[CallbackQueryHandler(fin_entry, pattern=r"^tool:(?:compound|goal|delay)$")],
-        states={
-            NEW_CALC_STATE: [
-                CallbackQueryHandler(fin_choice, pattern=r"^calc:(?:kind|freq|basis|rate|cancel)(?::.*)?$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, fin_text),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", fin_cancel_command),
-            CallbackQueryHandler(fin_cancel_home, pattern=r"^home$"),
-        ],
-        allow_reentry=True,
-    )
-    app.add_handler(financial_conversation)
+    app.add_handler(build_conversation())
+    app.add_handler(CallbackQueryHandler(expired_callback, pattern=r"^(?:term:|calc:|broadcast:(?:send|cancel))"))
 
     logger.info("Bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
